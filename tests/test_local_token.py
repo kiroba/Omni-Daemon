@@ -59,6 +59,18 @@ class LocalTokenRequired(unittest.TestCase):
         code, _ = self.d.post("/api/events/append", {"nope": True})
         self.assertEqual(code, 401)
 
+    def test_bearer_local_token_works(self):
+        # v8.20.0: apps set to "Remote hub 127.0.0.1" send the token as a bearer header.
+        code, body = self.d.get("/api/events/stats", headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(code, 200, body)
+        code, _ = http(f"{self.d.tel}/api/v1/telemetry/node-health",
+                       headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(code, 200)
+
+    def test_bearer_wrong_token_is_401(self):
+        code, _ = self.d.get("/api/events/stats", headers={"Authorization": "Bearer " + "x" * 43})
+        self.assertEqual(code, 401)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_token_file_is_owner_only(self):
         self.assertEqual(stat.S_IMODE(self.tok_file.stat().st_mode), 0o600)
