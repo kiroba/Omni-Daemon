@@ -23,6 +23,7 @@ sys.path.insert(0, str(ADMIN))
 
 _TMP = Path(tempfile.mkdtemp(prefix="omni_remote_hub_test_"))
 os.environ["HOME"] = str(_TMP)
+os.environ["USERPROFILE"] = str(_TMP)  # Path.home() reads USERPROFILE on Windows, not HOME
 os.environ.pop("OMNI_TRUSTED_KEYS_FILE", None)
 os.environ.pop("OMNI_LEGACY_FLOAT_TS", None)
 os.environ["OMNI_MESH_ID"] = "remote-test"
@@ -112,7 +113,8 @@ class RemoteHubTests(unittest.TestCase):
     def test_token_persisted_chmod_600_and_stable(self):
         p = Path(_TMP) / ".omni" / "hub_token"
         self.assertTrue(p.exists())
-        self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+        if os.name != "nt":  # Windows locks the file with an icacls owner-only ACL, not POSIX mode bits
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         self.assertGreaterEqual(len(self.token), 32)
         self.assertEqual(daemon.load_or_create_hub_token(p), self.token)  # same token on restart
 
