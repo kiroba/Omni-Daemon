@@ -64,6 +64,20 @@ class TwoDaemonRadioTest(unittest.TestCase):
         self.assertEqual((code, body["new"]), (200, False))
 
 
+    def test_ipv6_path(self):
+        """Wi-Fi Aware hands in IPv6 addresses: sync over [::1] to D's IPv6 listener."""
+        import socket
+        try:
+            socket.create_connection(("::1", self.D.ports["P2P_SYNC_PORT"]), timeout=2).close()
+        except OSError:
+            self.skipTest("no IPv6 loopback listener here")
+        code, _ = tc._http(f"{self.C.ipc}/api/sync/peers",
+                           {"host": "::1", "port": self.D.ports["P2P_SYNC_PORT"], "transport": "wifi_aware"})
+        self.assertEqual(code, 200)
+        eid = self.C.post("over ipv6")
+        self.assertTrue(tc._wait(lambda: eid in self.D.ids(), 20), "event never reached D over IPv6")
+
+
 class RadioPeerUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

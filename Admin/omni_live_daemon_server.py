@@ -331,6 +331,29 @@ class OmniHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
+class OmniHTTPServer6(OmniHTTPServer):
+    """IPv6-only listener (v8.18.0) next to the IPv4 one, so peers on a Wi-Fi Aware data path
+    (IPv6 link-local) can reach :5005. V6ONLY keeps IPv4 clients on the IPv4 socket, so their
+    addresses stay plain dotted quads for the peer gates."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
+
+def bind_p2p_ipv6(port: int, handler):
+    """Best effort: returns the server, or None when IPv6 is off/unavailable (OMNI_P2P_IPV6=0 disables)."""
+    if os.environ.get("OMNI_P2P_IPV6", "1").strip() in ("0", "false", "no") or not socket.has_ipv6:
+        return None
+    try:
+        return OmniHTTPServer6(("::", port), handler)
+    except OSError as e:
+        print(f"[!] IPv6 P2P listener on [::]:{port} not started ({e}); Wi-Fi Aware peers can't reach this node.", flush=True)
+        return None
+
 def bind_server(host: str, port: int, handler):
     """Binds or exits with a plain message when another process (usually a second daemon) has the port."""
     try:
@@ -3665,6 +3688,10 @@ def main():
         servers.append(bind_server(host, TELEMETRY_PORT, TelemetryHandler))
         servers.append(bind_server(host, CONTINUITY_IPC_PORT, ContinuityIPCHandler))
     servers.append(bind_server(P2P_HOST, P2P_SYNC_PORT, P2PSyncHandler))
+    _p2p6 = bind_p2p_ipv6(P2P_SYNC_PORT, P2PSyncHandler)
+    if _p2p6 is not None:
+        servers.append(_p2p6)
+        print(f"[✓] P2P Sync Server Bound (IPv6, for Wi-Fi Aware): http://[::]:{P2P_SYNC_PORT}/p2p/sync")
 
     t1.start()
     t2.start()

@@ -27,3 +27,7 @@ App → local Omni daemon → other daemons.
 
 ## Manual test (one PC, two daemons)
 `python -m unittest tests.test_radio_peers -v`
+
+## IPv6 listener
+`:5005` also listens on `[::]` (IPv6 only), so Wi-Fi Aware peers can connect. IPv4 is unchanged.
+Turn it off with `OMNI_P2P_IPV6=0`.
