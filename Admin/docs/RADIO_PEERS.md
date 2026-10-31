@@ -31,3 +31,11 @@ App → local Omni daemon → other daemons.
 ## IPv6 listener
 `:5005` also listens on `[::]` (IPv6 only), so Wi-Fi Aware peers can connect. IPv4 is unchanged.
 Turn it off with `OMNI_P2P_IPV6=0`.
+
+## v8.18.1: peer traffic bypasses HTTP proxies
+
+Relay and catch-up requests to peers now go through an opener with no proxy handler. Before this,
+`urllib` sent them through `HTTP_PROXY`/`HTTPS_PROXY` (and, on Windows, the system proxy). Its
+`NO_PROXY` matching also misses bracketed IPv6 hosts, so a Wi-Fi Aware peer such as
+`[fe80::1%aware_data0]` was posted to the proxy and got a 404 back. `tests/test_mesh_sim.py` runs every
+daemon with a dead `HTTP_PROXY` set to keep it that way.
