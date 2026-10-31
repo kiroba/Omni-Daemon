@@ -121,14 +121,15 @@ class SyncHeaderTests(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-        orig = daemon.urllib.request.urlopen
-        daemon.urllib.request.urlopen = lambda req, timeout=None: (sent.append(req), FakeResp())[1]
+        # v8.18.1: peer traffic goes through daemon._PEER_OPENER (no proxy), not urllib.request.urlopen
+        orig = daemon._PEER_OPENER.open
+        daemon._PEER_OPENER.open = lambda req, timeout=None: (sent.append(req), FakeResp())[1]
         try:
             with daemon.STATE.lock:
                 daemon.STATE.active_peers = {"10.9.9.9": {"ip": "10.9.9.9", "port": 5005, "last_seen": 0}}
             daemon.relay_event_to_peers(signed())
         finally:
-            daemon.urllib.request.urlopen = orig
+            daemon._PEER_OPENER.open = orig
             with daemon.STATE.lock:
                 daemon.STATE.active_peers = {}
         self.assertEqual(len(sent), 1)
