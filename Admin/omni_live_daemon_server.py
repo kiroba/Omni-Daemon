@@ -98,7 +98,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.17.1"
+VERSION = "8.18.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -204,6 +204,58 @@ def parse_sync_peers(value=None) -> list:
             raise ValueError(f"{SYNC_PEERS_ENV}: bad host in {entry!r}")
         peers.append((host, port))
     return peers
+
+RADIO_PEER_TTL = 120.0          # seconds a handed-in radio peer stays known without a refresh
+RADIO_PEER_MAX = 64
+RADIO_TRANSPORTS = {"ble", "wifi_aware", "lan", "manual"}
+_RADIO_HOST_RE = re.compile(r"[A-Za-z0-9.\-:%_]{1,255}")   # allows IPv6 scope ids (fe80::1%aware_data0)
+
+def peer_url(host: str, port: int, path: str) -> str:
+    """http URL for a peer; IPv6 literals (Wi-Fi Aware data paths are IPv6) go in brackets."""
+    h = host.strip("[]")
+    if ":" in h:
+        h = "[" + h.replace("%", "%25") + "]"
+    return f"http://{h}:{int(port)}{path}"
+
+def add_radio_peer(data: dict) -> tuple:
+    """Validates and stores a peer handed in by a local app. Returns (response, status)."""
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    host = str(data.get("host") or "").strip().strip("[]")
+    transport = str(data.get("transport") or "manual").strip().lower()
+    try:
+        port = int(data.get("port") or P2P_SYNC_PORT)
+    except (TypeError, ValueError):
+        return {"status": "ERROR", "message": "port must be a number"}, 400
+    if not host or not _RADIO_HOST_RE.fullmatch(host):
+        return {"status": "ERROR", "message": "host missing or malformed"}, 400
+    if not 0 < port < 65536:
+        return {"status": "ERROR", "message": "port out of range"}, 400
+    if transport not in RADIO_TRANSPORTS:
+        return {"status": "ERROR", "message": f"transport must be one of {sorted(RADIO_TRANSPORTS)}"}, 400
+    if (_is_loopback(host) or host == LOCAL_IP) and port == P2P_SYNC_PORT:
+        return {"status": "ERROR", "message": "that is this daemon"}, 400
+    node_hash = str(data.get("node_hash") or "")[:66]
+    now = time.time()
+    key = (host, port)
+    with STATE.lock:
+        for k in [k for k, v in STATE.radio_peers.items() if now - v["last_seen"] > RADIO_PEER_TTL]:
+            del STATE.radio_peers[k]
+        is_new = key not in STATE.radio_peers
+        if is_new and len(STATE.radio_peers) >= RADIO_PEER_MAX:
+            return {"status": "ERROR", "message": "too many radio peers"}, 429
+        STATE.radio_peers[key] = {"transport": transport, "node_hash": node_hash, "last_seen": now}
+    TELEMETRY.inc("radio_peer_new" if is_new else "radio_peer_refresh")
+    if is_new:
+        print(f"[✓] Radio peer via {transport}: {host}:{port}", flush=True)
+        STATE.catchup_wake.set()   # sync with it now, not at the next interval
+    return {"status": "OK", "new": is_new, "peer": f"{host}:{port}", "ttl_s": int(RADIO_PEER_TTL)}, 200
+
+def radio_peers_fresh() -> list:
+    """[(host, port, info)] handed in within RADIO_PEER_TTL."""
+    now = time.time()
+    with STATE.lock:
+        return [(h, p, dict(v)) for (h, p), v in STATE.radio_peers.items() if now - v["last_seen"] <= RADIO_PEER_TTL]
 
 def hub_token_path() -> Path:
     override = os.environ.get(HUB_TOKEN_FILE_ENV, "").strip()
@@ -396,6 +448,9 @@ class EngineState:
             sys.stderr.write(f"[x] FATAL: {e}\n")
             raise SystemExit(2)
         self.catchup_lock = threading.Lock()   # one catch-up run at a time
+        # v8.18.0: peers an app on this device found over a radio (BLE / Wi-Fi Aware / LAN scan) and
+        # handed in on loopback POST /api/sync/peers. {(host, port): {"transport", "node_hash", "last_seen"}}
+        self.radio_peers = {}
         self.catchup_wake = threading.Event()  # set when a new peer shows up
         self.last_catchup = None               # summary of the last run, shown in node-health
         self.udp_listener = "starting"         # "listening" / "bind failed: ..." (telemetry summary)
@@ -635,6 +690,8 @@ def _process_and_store_event(data: dict, origin_peer: str = None, relay: bool = 
 def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
     with STATE.lock:
         peers = list(STATE.active_peers.values())
+    seen = {(p.get("ip"), int(p.get("port") or P2P_SYNC_PORT)) for p in peers}
+    peers += [{"ip": h, "port": p} for h, p, _ in radio_peers_fresh() if (h, p) not in seen]
 
     json_bytes = json.dumps(event_envelope, sort_keys=True, separators=(',', ':')).encode('utf-8')
     for peer in peers:
@@ -645,7 +702,7 @@ def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
         if origin_peer and (peer_ip == origin_peer or f"{peer_ip}:{peer_port}" == origin_peer):
             continue  # Skip relaying back to sender!
 
-        url = f"http://{peer_ip}:{peer_port}/p2p/sync"
+        url = peer_url(peer_ip, peer_port, "/p2p/sync")
         try:
             req = urllib.request.Request(url, data=json_bytes, method='POST',
                                          headers={'Content-Type': 'application/json', MESH_HEADER: STATE.mesh_id})
@@ -2382,6 +2439,9 @@ def catchup_peers() -> list:
     with STATE.lock:
         found = [(p["ip"], int(p.get("port", P2P_SYNC_PORT))) for p in STATE.active_peers.values()
                  if now - p["last_seen"] < 15.0]
+    for host, port, _ in radio_peers_fresh():
+        if (host, port) not in peers:
+            peers.append((host, port))
     for host, port in found:
         if host in (LOCAL_IP, "127.0.0.1"):
             continue
@@ -2408,11 +2468,15 @@ def catchup_peer_allowed(ip: str) -> bool:
     for host, _ in STATE.sync_peers:
         if ip == host or ip in _resolve(host):
             return True
+    bare = ip.split("%", 1)[0]
+    for host, _, _ in radio_peers_fresh():
+        if ip == host or bare == host.split("%", 1)[0]:
+            return True
     return False
 
 def _peer_post(host: str, port: int, path: str, obj: dict, timeout: float = 10.0) -> tuple:
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(f"http://{host}:{port}{path}", data=body, method="POST",
+    req = urllib.request.Request(peer_url(host, port, path), data=body, method="POST",
                                  headers={"Content-Type": "application/json", MESH_HEADER: STATE.mesh_id})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -3243,6 +3307,15 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
         # Loopback: open as before. Non-loopback: remote hub on + bearer token, else 403/401.
         if not remote_gate(self, "GET", path):
             return
+        if path == "/api/sync/peers":
+            peers = [{"host": h, "port": p, "transport": v["transport"], "node_hash": v["node_hash"],
+                      "age_s": round(time.time() - v["last_seen"], 1)} for h, p, v in radio_peers_fresh()]
+            static = [{"host": h, "port": p, "transport": "static"} for h, p in STATE.sync_peers]
+            with STATE.lock:
+                lan = [{"host": v["ip"], "port": int(v.get("port") or P2P_SYNC_PORT), "transport": "udp_beacon",
+                        "age_s": round(time.time() - v["last_seen"], 1)} for v in STATE.active_peers.values()]
+            self._send_json(200, {"status": "OK", "radio": peers, "static": static, "lan": lan})
+            return
         if path == "/api/credits/balance":
             params = urllib.parse.parse_qs(query or "", keep_blank_values=True)
             self._credits_call(credits_balance, (params.get("pubkey") or [""])[-1],
@@ -3340,6 +3413,14 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not remote_gate(self, "POST", self.path):
+            return
+        if self.path == "/api/sync/peers":
+            # Loopback-only (never in REMOTE_POST_PATHS): an app on this device hands in a peer it
+            # found over BLE / Wi-Fi Aware / LAN scan. Re-post within RADIO_PEER_TTL to keep it.
+            data, ok = self._read_small_json(4096)
+            if ok:
+                resp, status = add_radio_peer(data)
+                self._send_json(status, resp)
             return
         if self.path == "/api/sync/catchup":
             # Loopback-only (never in REMOTE_POST_PATHS): run a catch-up pass now and report it.
