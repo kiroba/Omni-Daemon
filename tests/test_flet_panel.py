@@ -20,10 +20,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ADMIN = ROOT / "Admin"
 PANEL = ROOT / "backend_services" / "omni-ipc-daemon" / "omni_flet_desktop_control_panel.py"
-
-spec = importlib.util.spec_from_file_location("omni_flet_panel", PANEL)
-panel = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(panel)
+# The Flet panel lives in The-Omniverse monorepo, not in the split Omni-Daemon repo; skip cleanly here.
+HAS_PANEL = PANEL.is_file()
+SKIP_WHY = "Flet panel not in this repo (backend_services/omni-ipc-daemon/)"
+panel = None
+if HAS_PANEL:
+    spec = importlib.util.spec_from_file_location("omni_flet_panel", PANEL)
+    panel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(panel)
 
 
 def free_port():
@@ -45,6 +49,7 @@ class FakePage:
         self.updates += 1
 
 
+@unittest.skipUnless(HAS_PANEL, SKIP_WHY)
 class PanelAgainstLiveDaemon(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -110,7 +115,7 @@ class PanelAgainstLiveDaemon(unittest.TestCase):
         self.assertEqual(st, 0)
         self.assertIn("only allowed", body["message"])
 
-    @unittest.skipIf(panel.ft is None, "flet not installed")
+    @unittest.skipIf(panel is None or panel.ft is None, "flet not installed")
     def test_view_builds_on_flet_1_and_lists_events(self):
         ports = self.ports
 
@@ -128,6 +133,7 @@ class PanelAgainstLiveDaemon(unittest.TestCase):
         self.assertFalse(ui["post_button"].disabled)
 
 
+@unittest.skipUnless(HAS_PANEL, SKIP_WHY)
 class NoRemovedFletApis(unittest.TestCase):
     def test_source_avoids_removed_apis(self):
         src = PANEL.read_text(encoding="utf-8")
