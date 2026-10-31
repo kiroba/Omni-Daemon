@@ -18,8 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-    # Windows is Keith's hub OS; keep it visible but don't block merges until its known gaps are fixed.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # Windows is Keith's hub OS, so it blocks merges just like Ubuntu.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
