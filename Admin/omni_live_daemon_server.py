@@ -98,7 +98,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.19.0"
+VERSION = "8.20.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -3143,8 +3143,11 @@ def remote_gate(handler, method: str, path: str) -> bool:
     """True if the request may proceed. Loopback: always (unchanged behavior). Non-loopback: only
     with remote hub enabled, an allowed path and a valid bearer token; otherwise sends 403/401."""
     if _is_loopback(handler.client_address[0]):
-        if LOCAL_TOKEN_REQUIRED and not check_local_token(handler.headers.get(LOCAL_TOKEN_HEADER),
-                                                          STATE.local_token):
+        # v8.20.0: "Authorization: Bearer <local token>" is accepted too, so an app whose Hub setting
+        # is "Remote hub 127.0.0.1" + the token copied from Omni Node works with no app update.
+        if LOCAL_TOKEN_REQUIRED and not (
+                check_local_token(handler.headers.get(LOCAL_TOKEN_HEADER), STATE.local_token)
+                or check_bearer(handler.headers.get("Authorization"), STATE.local_token)):
             TELEMETRY.inc("local_token_failures")
             _deny(handler, 401, "missing or invalid local token")
             return False
