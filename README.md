@@ -1,9 +1,8 @@
-# The Omni-Hub (daemon)
+# Omni-Daemon
 
-The Omniverse hub daemon (`Admin/omni_live_daemon_server.py`) and its test suite, split out of
-[kiroba/The-Omniverse](https://github.com/kiroba/The-Omniverse) `desktop` branch with full history (76 commits; tracked `*.db` files removed).
+The networked protocol layer of The Omniverse. One daemon runs on each device. It keeps the signed event log, syncs with peers (negentropy catch-up), offers remote access over Tailscale, runs the test-credits ledger, and handles OmniCast signaling. Apps only ever talk to their own device's daemon.
 
 - Daemon and engines: `Admin/` (docs in `Admin/docs/`)
-- Tests: `python3 -m unittest tests.<name>` from the repo root
+- Tests: `python3 -m unittest tests.<name>`, run from the repo root
 
-The monorepo stays the source of truth until the split is complete; see the split plan issue there.
+Split out of [kiroba/The-Omniverse](https://github.com/kiroba/The-Omniverse) (`desktop` branch) with full history, minus tracked `*.db` files. Formerly named The-Omni-Hub.
