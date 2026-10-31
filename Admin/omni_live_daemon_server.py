@@ -98,7 +98,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.18.0"
+VERSION = "8.18.1"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -710,6 +710,11 @@ def _process_and_store_event(data: dict, origin_peer: str = None, relay: bool = 
 
     return {"status": "SUCCESS", "event_id": event_id, "merkle_hash": prev_hash, **time_fields}, 200
 
+# v8.18.1: peer traffic never goes through an HTTP proxy. urllib.urlopen honours HTTP(S)_PROXY and, on
+# Windows, the system proxy from the registry; its NO_PROXY matching also misses bracketed IPv6 hosts,
+# so a Wi-Fi Aware peer like [fe80::1%aware_data0] was sent to the proxy and got its 404 back.
+_PEER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
     with STATE.lock:
         peers = list(STATE.active_peers.values())
@@ -729,7 +734,7 @@ def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
         try:
             req = urllib.request.Request(url, data=json_bytes, method='POST',
                                          headers={'Content-Type': 'application/json', MESH_HEADER: STATE.mesh_id})
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
+            with _PEER_OPENER.open(req, timeout=2.0) as resp:
                 pass
             TELEMETRY.inc("relay_ok")
         except Exception:
@@ -2502,7 +2507,7 @@ def _peer_post(host: str, port: int, path: str, obj: dict, timeout: float = 10.0
     req = urllib.request.Request(peer_url(host, port, path), data=body, method="POST",
                                  headers={"Content-Type": "application/json", MESH_HEADER: STATE.mesh_id})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _PEER_OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, json.loads(raw), len(body) + len(raw)
     except urllib.error.HTTPError as e:
