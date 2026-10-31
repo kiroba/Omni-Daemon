@@ -119,7 +119,8 @@ class Daemon:
                         OMNI_CATCHUP_STARTUP_DELAY="3600", NO_PROXY="*", OMNI_TELEMETRY_CACHE_S="0",
                         **{k: str(v) for k, v in self.ports.items()})
         for k in ("OMNI_TRUSTED_KEYS_FILE", "OMNI_LEGACY_FLOAT_TS", "OMNI_SYNC_PEERS", "OMNI_HUB_TOKEN_FILE",
-                  "OMNI_HUB_REMOTE", "OMNI_HUB_BIND", "OMNI_TREASURY_FEE_BPS"):
+                  "OMNI_HUB_REMOTE", "OMNI_HUB_BIND", "OMNI_TREASURY_FEE_BPS", "OMNI_LOCAL_TOKEN",
+                  "OMNI_LOCAL_TOKEN_FILE"):
             self.env.pop(k, None)
         if remote:
             self.env.update(OMNI_HUB_REMOTE="1", OMNI_HUB_BIND="0.0.0.0")
@@ -129,6 +130,7 @@ class Daemon:
         self.tel = f"http://127.0.0.1:{self.ports['OMNI_TELEMETRY_PORT']}"
         self.db = self.cwd / "continuity_events.db"
         self.proc = None
+        self.start_headers = {}  # e.g. {"X-Omni-Local-Token": ...} when OMNI_LOCAL_TOKEN=1
 
     def start(self):
         self.log = open(self.cwd / "daemon.log", "a")
@@ -139,7 +141,8 @@ class Daemon:
             if self.proc.poll() is not None:
                 break
             try:
-                code, body = http(f"{self.tel}/api/v1/telemetry/node-health", timeout=2)
+                code, body = http(f"{self.tel}/api/v1/telemetry/node-health", timeout=2,
+                                  headers=self.start_headers)
                 if code == 200:
                     self.node_id, self.version = body["node_id"], body["version"]
                     return self

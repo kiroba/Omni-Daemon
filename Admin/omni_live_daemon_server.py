@@ -98,7 +98,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.18.1"
+VERSION = "8.19.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -165,6 +165,16 @@ REMOTE_POST_PATHS = {"/api/events/append", "/api/bugs/report", "/api/signal/send
                      "/api/telemetry/app-checkin"}
 _APP_ENVELOPE_KEYS = ("app_event_id", "app_author_pubkey", "app_signature", "app_previous_hash",
                       "app_ts", "app_timestamp")
+
+# Local token (v8.19.0, opt-in). On a PC, loopback means the owner. On a phone every installed app can
+# reach 127.0.0.1, so the Android node app sets OMNI_LOCAL_TOKEN=1: then loopback requests to the app
+# ports (:5000, :9100) must also send "X-Omni-Local-Token: <token>" (token in ~/.omni/local_token,
+# owner-only, or OMNI_LOCAL_TOKEN_FILE). The node app hands it only to Omni apps signed with its key.
+# P2P :5005 is unchanged (mesh header + signatures).
+LOCAL_TOKEN_ENV = "OMNI_LOCAL_TOKEN"
+LOCAL_TOKEN_FILE_ENV = "OMNI_LOCAL_TOKEN_FILE"
+LOCAL_TOKEN_HEADER = "X-Omni-Local-Token"
+LOCAL_TOKEN_REQUIRED = os.environ.get(LOCAL_TOKEN_ENV, "").strip().lower() in ("1", "true", "yes")
 
 # Catch-up sync (v8.8.0). Peers come from UDP discovery (same mesh) plus OMNI_SYNC_PEERS, a
 # comma-separated list of host:port P2P endpoints (needed over Tailscale, where beacons don't reach).
@@ -291,6 +301,20 @@ def restrict_to_owner(path: Path, is_dir: bool = False, windows: bool = None):
     grant = f"*{_windows_owner_sid()}:" + ("(OI)(CI)F" if is_dir else "F")
     subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", grant],
                    capture_output=True, text=True, check=True, timeout=15)
+
+def local_token_path() -> Path:
+    override = os.environ.get(LOCAL_TOKEN_FILE_ENV, "").strip()
+    return Path(override) if override else Path.home() / ".omni" / "local_token"
+
+def load_or_create_local_token(path: Path = None) -> str:
+    """Same storage rules as the remote-hub token, separate file (a leaked hub token must not unlock
+    loopback, and the other way round)."""
+    return load_or_create_hub_token(path or local_token_path())
+
+def check_local_token(header_value, token) -> bool:
+    if not token or not header_value:
+        return False
+    return hmac.compare_digest(str(header_value).strip().encode("utf-8"), token.encode("utf-8"))
 
 def load_or_create_hub_token(path: Path = None) -> str:
     """Returns the persisted remote-hub token, creating it owner-only on first use.
@@ -465,6 +489,7 @@ class EngineState:
         if self.trusted_keys is not None:
             self.trusted_keys = self.trusted_keys | {self.node_id}  # our own relayed events
         self.hub_token = load_or_create_hub_token() if HUB_REMOTE else None
+        self.local_token = load_or_create_local_token() if LOCAL_TOKEN_REQUIRED else None
         try:
             self.sync_peers = parse_sync_peers()
         except ValueError as e:
@@ -3118,6 +3143,11 @@ def remote_gate(handler, method: str, path: str) -> bool:
     """True if the request may proceed. Loopback: always (unchanged behavior). Non-loopback: only
     with remote hub enabled, an allowed path and a valid bearer token; otherwise sends 403/401."""
     if _is_loopback(handler.client_address[0]):
+        if LOCAL_TOKEN_REQUIRED and not check_local_token(handler.headers.get(LOCAL_TOKEN_HEADER),
+                                                          STATE.local_token):
+            TELEMETRY.inc("local_token_failures")
+            _deny(handler, 401, "missing or invalid local token")
+            return False
         TELEMETRY.inc("api_requests_loopback")
         return True
     allowed = REMOTE_POST_PATHS if method == "POST" else REMOTE_GET_PATHS
