@@ -4,6 +4,7 @@ The networked protocol layer of The Omniverse. One daemon runs on each device. I
 
 - Daemon and engines: `Admin/` (docs in `Admin/docs/`)
 - Tests: `python3 -m unittest tests.<name>`, run from the repo root
+- **Omni Node for desktop** (Windows, macOS, Linux): `python Admin/omni_node_desktop.py`. It has the same screen and words as Omni Node on Android, with an optional tray icon. See `Admin/docs/NODE_DESKTOP.md`
 
 ## What a node does
 
