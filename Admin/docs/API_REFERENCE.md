@@ -23,6 +23,9 @@ returns. Values are made up.
 | Social | POST | `/api/social/react` | 5000 | yes | [→](#post-apisocialreact) |
 | Social | GET | `/api/social/thread` | 5000 | yes | [→](#get-apisocialthread) |
 | Social | GET | `/api/social/counts` | 5000 | yes | [→](#get-apisocialcounts) |
+| Pairing (v8.24.0) | POST | `/api/pair/offer`, `/api/pair/cancel`, `/api/pair/accept`, `/api/pair/remove` | 5000 | **no**, loopback only (+ local token) | [QUIET_MESH.md](QUIET_MESH.md) |
+| Pairing (v8.24.0) | GET | `/api/pair/list`, `/api/pair/offer` | 5000 | **no**, loopback only (+ local token) | [QUIET_MESH.md](QUIET_MESH.md) |
+| Pairing (v8.24.0) | POST | `/p2p/pair` (only while an offer is open), `/p2p/auth` (quiet mode) | 5005 | peers | [QUIET_MESH.md](QUIET_MESH.md) |
 | Profiles/Contacts | POST | `/api/profile/update` | 5000 | yes | [→](#post-apiprofileupdate) |
 | Profiles/Contacts | POST | `/api/profile/social-import` (v8.23.0) | 5000 | yes | [→](#post-apiprofilesocial-import) |
 | Profiles/Contacts | GET | `/api/profile` | 5000 | yes | [→](#get-apiprofile) |

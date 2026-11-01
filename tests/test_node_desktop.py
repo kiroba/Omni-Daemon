@@ -49,7 +49,61 @@ class SameWordsAsAndroid(unittest.TestCase):
         self.assertEqual(W.cap_label(0), "unlimited")
 
 
+    def test_pairing_words(self):
+        """Same strings as NodePairing.kt (Omni-Node-Daemon, Pair a device). Change both together."""
+        self.assertEqual(W.PAIR_TITLE, "Pair a device")
+        self.assertEqual(W.PAIR_SHOW, "Show a code")
+        self.assertEqual(W.PAIR_ENTER, "Enter a code")
+        self.assertEqual(W.PAIR_STOP, "Stop showing the code")
+        self.assertEqual(W.PAIR_HINT, "Pair your phone, your PC or a friend's device. Paired nodes find each other "
+                                      "quietly: other people on the same Wi-Fi can't see who you are.")
+        self.assertEqual(W.PAIR_CODE_HOWTO, "On the other device open Omni Node, choose Pair a device, then Enter a "
+                                            "code and type this code. Keep both on the same Wi-Fi.")
+        self.assertEqual(W.PAIR_ENTER_HOWTO, "Type the 6-digit code the other device shows, or paste its pairing "
+                                             "text. If it can't be found, add its address after the code, like "
+                                             "123456 192.168.1.20")
+        self.assertEqual(W.PAIR_LOOKING, "Looking for the other device...")
+        self.assertEqual(W.PAIR_DONE, "Paired. Your nodes now find each other quietly.")
+        self.assertEqual(W.PAIR_WRONG, "That code didn't match.")
+        self.assertEqual(W.PAIR_LOCKED, "Too many wrong codes. Make a new code on the other device.")
+        self.assertEqual(W.PAIR_NONE, "No paired devices yet.")
+        self.assertEqual(W.PAIR_COPY, "Copy pairing text")
+        self.assertEqual(W.PAIR_TEXT_WARNING, "Anyone with this text can pair with you while the code shows. "
+                                              "Only send it to yourself.")
+        self.assertEqual(W.PAIR_REMOVE, "Remove")
+        self.assertEqual(W.PAIR_ENDED, "The code stopped working. Show a new one.")
+        self.assertEqual(W.pair_expires(272, 5), "Expires in 4:32 · 5 tries left")
+        self.assertEqual(W.pair_expires(9, 1), "Expires in 0:09 · 1 try left")
+        self.assertEqual(W.pair_code_display("012345"), "012 345")
+        self.assertEqual(W.pair_remove_confirm("Kiro's phone"),
+                         "Remove Kiro's phone? Your nodes stop syncing with each other. To connect again, pair again.")
+        self.assertEqual(W.paired_line({"name": "Kiro PC", "tag": "·4f23", "online": True}), "Kiro PC ·4f23  ·  nearby now")
+        self.assertEqual(W.paired_line({"name": "Kiro PC", "tag": "·4f23"}), "Kiro PC ·4f23  ·  not nearby")
+
+    def test_quiet_line(self):
+        self.assertEqual(W.quiet_line(None), ("Quiet mode: checking...", W.TEXT_3))
+        self.assertEqual(W.quiet_line({"mode": "off"})[0], "Quiet mode: off on this node")
+        self.assertEqual(W.quiet_line({"mode": "auto", "active": False, "paired": 0})[0],
+                         "Quiet mode: off until you pair a device")
+        self.assertEqual(W.quiet_line({"mode": "auto", "active": True, "paired": 1}),
+                         ("Quiet mode: on · only your 1 paired device can see this node", W.GREEN))
+        self.assertEqual(W.quiet_line({"mode": "on", "active": True, "paired": 3})[0],
+                         "Quiet mode: on · only your 3 paired devices can see this node")
+        self.assertEqual(W.quiet_line({"mode": "on", "active": True, "paired": 0})[0],
+                         "Quiet mode: on · no devices paired yet")
+
+
 class Helpers(unittest.TestCase):
+    def test_parse_pair_input(self):
+        self.assertEqual(D.parse_pair_input(" 123 456 "), {"code": "123456"})
+        self.assertEqual(D.parse_pair_input("123-456"), {"code": "123456"})
+        self.assertEqual(D.parse_pair_input("123456 192.168.1.20"),
+                         {"code": "123456", "host": "192.168.1.20", "port": 5005})
+        self.assertEqual(D.parse_pair_input("123456 10.0.0.2:6000"), {"code": "123456", "host": "10.0.0.2", "port": 6000})
+        self.assertEqual(D.parse_pair_input("omni://pair?p=abc"), {"payload": "omni://pair?p=abc"})
+        for bad in ("", "12345", "1234567", "abc def", "123456 bad host!"):
+            self.assertIsNone(D.parse_pair_input(bad), bad)
+
     def test_status_line(self):
         self.assertEqual(W.status_line(HEALTH, False), W.OFF)
         self.assertEqual(W.status_line(None, True), W.STARTING)
@@ -167,6 +221,23 @@ class AgainstARealDaemon(unittest.TestCase):
         code, _ = self.client.add_peer("bad host!", 5005)
         self.assertEqual(code, 400)
 
+    def test_pairing_calls(self):
+        code, body = self.client.pair_list()
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["quiet"]["mode"], body["quiet"]["active"], body["peers"]), ("auto", False, []))
+        code, offer = self.client.pair_offer()
+        self.assertEqual(code, 200, offer)
+        self.assertTrue(offer["active"])
+        self.assertEqual(len(offer["code"]), 6)
+        self.assertTrue(offer["payload"].startswith("omni://pair?p="))
+        self.assertEqual(self.client.pair_offer_status()[1]["code"], offer["code"])
+        self.assertEqual(self.client.pair_cancel()[0], 200)
+        self.assertFalse(self.client.pair_offer_status()[1]["active"])
+        self.assertEqual(self.client.pair_accept("12")[0], 400)
+        self.assertEqual(self.client.pair_remove("ab" * 32)[0], 404)
+        with mock.patch.object(D.NodeClient, "token", return_value=None):
+            self.assertEqual(D.NodeClient().pair_list()[0], 401)
+
     def test_daemon_process_attaches_to_running_node(self):
         p = D.DaemonProcess(self.client)
         p.start()
@@ -196,8 +267,32 @@ class AgainstARealDaemon(unittest.TestCase):
                 win._poll()   # real round trip to the daemon, off the Tk thread in the app
                 root.update()
                 self.assertEqual(win.status.cget("text"), W.LOOKING)
+                self.assertEqual(win.quiet.cget("text"), "Quiet mode: off until you pair a device")
+                self.assertEqual(win.paired_box.winfo_children()[0].cget("text"), W.PAIR_NONE)
+                # Pair a device: a code showing and two paired devices
+                win.offer = {"active": True, "code": "012345", "payload": "omni://pair?p=xyz", "expires_in": 272,
+                             "attempts_left": 5}
+                win.pairing = {"quiet": {"mode": "auto", "active": True, "paired": 2},
+                               "peers": [{"pubkey": "ab" * 32, "tag": "·abab", "name": "Kiro phone", "online": True},
+                                         {"pubkey": "cd" * 32, "tag": "·cdcd", "name": "Work PC", "online": False}]}
+                win.health = dict(HEALTH, quiet={"mode": "auto", "active": True, "paired": 2})
+                win.render()
+                root.update_idletasks()
+                self.assertEqual(win.offer_code.cget("text"), "012 345")
+                self.assertEqual(win.offer_expiry.cget("text"), "Expires in 4:32 · 5 tries left")
+                self.assertEqual(win.offer_text.get(), "omni://pair?p=xyz")
+                self.assertEqual(win.offer_box.winfo_manager(), "pack")
+                self.assertEqual(win.quiet.cget("text"), "Quiet mode: on · only your 2 paired devices can see this node")
+                rows = win.paired_box.winfo_children()
+                self.assertEqual(len(rows), 2)
+                labels = [w.cget("text") for r in rows for w in r.winfo_children() if isinstance(w, tk.Label)]
+                self.assertEqual(labels, ["Kiro phone ·abab  ·  nearby now", "Work PC ·cdcd  ·  not nearby"])
+                win.offer = None
+                win.render()
+                self.assertEqual(win.offer_box.winfo_manager(), "")
                 win.toggle_network()
                 self.assertEqual(win.status.cget("text"), W.OFF)
+                self.assertEqual(win.quiet.cget("text"), "Quiet mode: off (turn on Network first)")
         finally:
             root.destroy()
 

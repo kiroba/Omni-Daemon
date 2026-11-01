@@ -60,6 +60,14 @@ token. See Admin/docs/SOCIAL.md.
 Social profile import (v8.23.0): POST :5000/api/profile/social-import takes a person-signed
 PROFILE_SOCIAL_IMPORT event from kiroba/Continuity-Engine (blind-hashed contacts only, max 500 per
 event, 128 KB body). /api/events/append refuses that action. See Admin/docs/SOCIAL_IMPORT.md.
+Quiet mesh (v8.24.0): pairing, private beacons, stealth :5005. Loopback :5000/api/pair/* makes a
+short-lived offer (6-digit code + QR payload) and accepts one (code over the LAN, or a pasted/scanned
+payload); the two nodes swap keys over :5005 in a code-authenticated X25519 exchange and remember each
+other in ~/.omni/paired_peers.json (0600). Once paired (OMNI_QUIET_MESH=auto, the default; "on" = always,
+"off" = old behavior), beacons carry only nonce + HMAC(mesh key, epoch || nonce) sent to RFC1918 directed
+broadcasts, and :5005 closes the connection without a byte for anyone who hasn't completed the signed
+challenge-response, with a per-IP token bucket and a temporary block after repeated failures. Unpaired
+nodes behave exactly as before. See Admin/docs/QUIET_MESH.md.
 Signed credit transfers (v8.15.0): POST :5000/api/credits/send takes a transfer signed by the "from"
 key (kinds transfer/purchase/tip, optional ref such as a post id, unique nonce, ts within 10 min). The
 signature, nonce and ts are stored inside the ledger entry and re-verified on every replay; a reused
@@ -95,16 +103,20 @@ from omni_signing import (load_or_create_key, pubkey_hex, sign_event, verify_eve
 import omni_negentropy as neg
 import omni_wan
 import omni_relay
+import omni_quiet_mesh as qm
+import io
+import collections
 import ipaddress
 import threading
 import socket
 import urllib.request
 import urllib.error
 import urllib.parse
+import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.23.0"
+VERSION = "8.24.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -312,6 +324,10 @@ def local_token_path() -> Path:
     override = os.environ.get(LOCAL_TOKEN_FILE_ENV, "").strip()
     return Path(override) if override else Path.home() / ".omni" / "local_token"
 
+def paired_store_path() -> Path:
+    override = os.environ.get(qm.STORE_ENV, "").strip()
+    return Path(override) if override else Path.home() / ".omni" / "paired_peers.json"
+
 def load_or_create_local_token(path: Path = None) -> str:
     """Same storage rules as the remote-hub token, separate file (a leaked hub token must not unlock
     loopback, and the other way round)."""
@@ -374,20 +390,41 @@ class OmniHTTPServer6(OmniHTTPServer):
             pass
         super().server_bind()
 
+class P2PServerMixin:
+    """v8.24.0: in quiet mode every new :5005 connection first passes the per-IP token bucket and the
+    temporary block list. A refused connection is closed before a byte is read or written."""
+
+    def verify_request(self, request, client_address):
+        if not quiet_active():
+            return True
+        ip = str(client_address[0]).split("%", 1)[0]
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        if STATE.p2p_gate.allow(ip):
+            return True
+        TELEMETRY.inc("p2p_rate_limited")
+        return False
+
+class P2PServer(P2PServerMixin, OmniHTTPServer):
+    pass
+
+class P2PServer6(P2PServerMixin, OmniHTTPServer6):
+    pass
+
 def bind_p2p_ipv6(port: int, handler):
     """Best effort: returns the server, or None when IPv6 is off/unavailable (OMNI_P2P_IPV6=0 disables)."""
     if os.environ.get("OMNI_P2P_IPV6", "1").strip() in ("0", "false", "no") or not socket.has_ipv6:
         return None
     try:
-        return OmniHTTPServer6(("::", port), handler)
+        return P2PServer6(("::", port), handler)
     except OSError as e:
         print(f"[!] IPv6 P2P listener on [::]:{port} not started ({e}); Wi-Fi Aware peers can't reach this node.", flush=True)
         return None
 
-def bind_server(host: str, port: int, handler):
+def bind_server(host: str, port: int, handler, cls=None):
     """Binds or exits with a plain message when another process (usually a second daemon) has the port."""
     try:
-        return OmniHTTPServer((host, port), handler)
+        return (cls or OmniHTTPServer)((host, port), handler)
     except OSError as e:
         print(f"[X] Port {host}:{port} is already in use ({e}). Is another Omniverse daemon running? "
               f"Stop it first; only one daemon per machine.", flush=True)
@@ -491,9 +528,35 @@ class EngineState:
         self.tx_bytes = 0
         self.lock = threading.Lock()
         # None = no allowlist (any valid signature accepted). Raises on a bad/missing file.
-        self.trusted_keys = load_trusted_keys()
-        if self.trusted_keys is not None:
-            self.trusted_keys = self.trusted_keys | {self.node_id}  # our own relayed events
+        self.file_trusted_keys = load_trusted_keys()
+        self.trusted_keys = None
+        if self.file_trusted_keys is not None:
+            self.trusted_keys = set(self.file_trusted_keys) | {self.node_id}  # our own relayed events
+        # v8.24.0 quiet mesh. Paired devices also join the allowlist when one is configured.
+        try:
+            self.quiet_mode = qm.parse_mode()
+            self.beacon_extra_targets = qm.parse_targets()
+        except ValueError as e:
+            sys.stderr.write(f"[x] FATAL: {e}\n")
+            raise SystemExit(2)
+        self.paired = qm.PairedStore(paired_store_path(),
+                                     restrict=lambda path, is_dir: restrict_to_owner(path, is_dir=is_dir))
+        if self.trusted_keys is not None and self.quiet_mode != "off":
+            self.trusted_keys |= self.paired.keys()
+        self.pair_offer = None                 # qm.PairOffer while one is showing
+        self.pair_open_seen = {}               # ip -> (p2p port, seen at): "pairing open" beacons heard
+        self.p2p_gate = qm.IPGate(burst=_env_float("OMNI_P2P_RATE_BURST", 30.0),
+                                  rate=_env_float("OMNI_P2P_RATE_PER_S", 5.0),
+                                  fail_limit=int(_env_float("OMNI_P2P_FAIL_LIMIT", 5)),
+                                  block_s=_env_float("OMNI_P2P_BLOCK_S", 600.0))
+        self.handshakes = {}                   # sid -> half-done /p2p/auth (server side)
+        self.sessions_srv = {}                 # sid -> authenticated peer session (server side)
+        self.sessions_cli = {}                 # (host, port) -> our session at that peer (client side)
+        self.cli_backoff = {}                  # (host, port) -> don't retry the handshake before
+        self.auth_nonces = {}                  # client nonce -> seen at (replay guard for /p2p/auth)
+        self.own_beacon_nonces = collections.deque(maxlen=512)
+        self.beacon_nonces_seen = collections.OrderedDict()
+        self.paired_live = {}                  # pubkey -> {"host", "port", "last_seen"} after a good handshake
         self.hub_token = load_or_create_hub_token() if HUB_REMOTE else None
         self.local_token = load_or_create_local_token() if LOCAL_TOKEN_REQUIRED else None
         try:
@@ -755,22 +818,22 @@ def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
         peers = list(STATE.active_peers.values())
     seen = {(p.get("ip"), int(p.get("port") or P2P_SYNC_PORT)) for p in peers}
     peers += [{"ip": h, "port": p} for h, p, _ in radio_peers_fresh() if (h, p) not in seen]
+    seen |= {(p.get("ip"), int(p.get("port") or P2P_SYNC_PORT)) for p in peers}
+    for h, p in paired_live_peers():        # v8.24.0: paired devices, reached through a signed session
+        if (h, p) not in seen and not is_self_addr(h, p):
+            peers.append({"ip": h, "port": p, "paired": True})
 
     json_bytes = json.dumps(event_envelope, sort_keys=True, separators=(',', ':')).encode('utf-8')
     for peer in peers:
         peer_ip = peer.get("ip")
-        if not peer_ip or peer_ip == LOCAL_IP or peer_ip == "127.0.0.1":
+        if not peer_ip or ((peer_ip == LOCAL_IP or peer_ip == "127.0.0.1") and not peer.get("paired")):
             continue
         peer_port = int(peer.get("port") or P2P_SYNC_PORT)   # the port the peer advertised
         if origin_peer and (peer_ip == origin_peer or f"{peer_ip}:{peer_port}" == origin_peer):
             continue  # Skip relaying back to sender!
 
-        url = peer_url(peer_ip, peer_port, "/p2p/sync")
         try:
-            req = urllib.request.Request(url, data=json_bytes, method='POST',
-                                         headers={'Content-Type': 'application/json', MESH_HEADER: STATE.mesh_id})
-            with _PEER_OPENER.open(req, timeout=2.0) as resp:
-                pass
+            peer_request(peer_ip, peer_port, "/p2p/sync", json_bytes, timeout=2.0)
             TELEMETRY.inc("relay_ok")
         except Exception:
             TELEMETRY.inc("relay_failed")
@@ -831,6 +894,42 @@ def beacon_allowed(msg: dict, peer_ip: str) -> bool:
         return False
     return True
 
+_QUIET_TARGETS = {"at": 0.0, "value": []}
+
+def quiet_beacon_targets() -> list:
+    """(addr, udp port) to send quiet beacons to: the directed broadcast of every RFC1918 interface
+    (re-read every 60 s, Wi-Fi changes), plus OMNI_QUIET_BEACON_TARGETS. Never 255.255.255.255, never
+    Tailscale (100.64/10), link-local or loopback broadcasts."""
+    now = time.time()
+    if now - _QUIET_TARGETS["at"] > 60.0:
+        try:
+            _QUIET_TARGETS["value"] = [(b, UDP_DISCOVERY_PORT) for b in qm.private_broadcasts(default_ip=LOCAL_IP)]
+        except Exception:
+            _QUIET_TARGETS["value"] = []
+        _QUIET_TARGETS["at"] = now
+    return list(_QUIET_TARGETS["value"]) + list(STATE.beacon_extra_targets)
+
+def build_quiet_beacons() -> list:
+    """One 48-byte token per paired mesh key: nonce || HMAC(beacon key, epoch || nonce). Nothing else."""
+    out = []
+    for entry in STATE.paired.entries():
+        pkt = qm.beacon_token(entry["mesh_key"])
+        STATE.own_beacon_nonces.append(pkt[:qm.NONCE_LEN])
+        out.append(pkt)
+    return out
+
+def pair_open_beacon() -> bytes:
+    """While an offer shows: "a pairing offer is open here, on this port". No key, code or id."""
+    return json.dumps({"type": "OMNI_PAIR_OPEN", "port": P2P_SYNC_PORT}, separators=(",", ":")).encode("utf-8")
+
+def _send_all(sock, payload: bytes, targets: list, counter: str):
+    for addr in targets:
+        try:
+            sock.sendto(payload, addr)
+            TELEMETRY.inc(counter)
+        except OSError:
+            TELEMETRY.inc("beacons_send_failed")
+
 def udp_discovery_broadcaster():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -838,9 +937,19 @@ def udp_discovery_broadcaster():
 
     while True:
         try:
-            payload = json.dumps(build_beacon()).encode('utf-8')
-            sock.sendto(payload, ('<broadcast>', UDP_DISCOVERY_PORT))
-            TELEMETRY.inc("beacons_sent")
+            quiet = quiet_active()
+            if quiet:
+                targets = quiet_beacon_targets()
+                for pkt in build_quiet_beacons():
+                    _send_all(sock, pkt, targets, "quiet_beacons_sent")
+            else:
+                payload = json.dumps(build_beacon()).encode('utf-8')
+                sock.sendto(payload, ('<broadcast>', UDP_DISCOVERY_PORT))
+                TELEMETRY.inc("beacons_sent")
+            if pair_offer_active():
+                targets = quiet_beacon_targets() if quiet else \
+                    [('<broadcast>', UDP_DISCOVERY_PORT)] + list(STATE.beacon_extra_targets)
+                _send_all(sock, pair_open_beacon(), targets, "pair_open_beacons_sent")
         except Exception:
             TELEMETRY.inc("beacons_send_failed")
         time.sleep(3.0)
@@ -857,8 +966,12 @@ def log_mesh_reject_once(peer_ip: str, their_mesh, where: str):
     print(f"[!] {where}: ignoring {peer_ip}: mesh {shown} != ours ({STATE.mesh_id})", flush=True)
 
 def handle_discovery_packet(msg: dict, peer_ip: str) -> bool:
-    """Adds the sender to active_peers if it is a beacon from another node on our mesh. Returns True if added."""
+    """Adds the sender to active_peers if it is a beacon from another node on our mesh. Returns True if added.
+    In quiet mode (v8.24.0) open beacons are ignored: only paired devices are peers."""
     if not isinstance(msg, dict) or msg.get("type") != "OMNI_P2P_BEACON" or msg.get("node_id") == STATE.node_id:
+        return False
+    if quiet_active():
+        TELEMETRY.inc("beacons_ignored_quiet")
         return False
     their_mesh = msg.get("mesh_id")
     if their_mesh != STATE.mesh_id:
@@ -895,8 +1008,14 @@ def udp_discovery_listener():
 
     while True:
         try:
-            data, addr = sock.recvfrom(1024)
+            data, addr = sock.recvfrom(2048)
+            if len(data) == qm.BEACON_LEN and data[:1] != b"{":
+                handle_quiet_beacon(data, addr[0])
+                continue
             msg = json.loads(data.decode('utf-8'))
+            if isinstance(msg, dict) and msg.get("type") == "OMNI_PAIR_OPEN":
+                note_pair_open(msg, addr[0])
+                continue
             handle_discovery_packet(msg, addr[0])
         except Exception:
             pass
@@ -2786,6 +2905,10 @@ def catchup_peers() -> list:
             continue
         if (host, port) not in peers:
             peers.append((host, port))
+    if STATE.quiet_mode != "off":
+        for host, port in paired_dial_targets():      # v8.24.0: paired devices (signed session)
+            if (host, port) not in peers:
+                peers.append((host, port))
     return peers
 
 def _resolve(host: str) -> set:
@@ -2924,20 +3047,609 @@ def pull_signals(query: str):
     for host, port in signal_peers():
         threading.Thread(target=one, args=(host, port), daemon=True).start()
 
-def _peer_post(host: str, port: int, path: str, obj: dict, timeout: float = 10.0) -> tuple:
-    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(peer_url(host, port, path), data=body, method="POST",
-                                 headers={"Content-Type": "application/json", MESH_HEADER: STATE.mesh_id})
+def _raw_post(host: str, port: int, path: str, body: bytes, headers: dict, timeout: float) -> tuple:
+    """(status, raw body). HTTP errors are answers; a refused, reset or silently closed connection raises."""
+    h = {"Content-Type": "application/json", **headers}
+    req = urllib.request.Request(peer_url(host, port, path), data=body, method="POST", headers=h)
     try:
         with _PEER_OPENER.open(req, timeout=timeout) as resp:
-            raw = resp.read()
-            return resp.status, json.loads(raw), len(body) + len(raw)
+            return resp.status, resp.read()
     except urllib.error.HTTPError as e:
-        raw = e.read()
+        return e.code, e.read()
+
+def _json_or_empty(raw: bytes) -> dict:
+    try:
+        v = json.loads(raw) if raw else {}
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+def _peer_post(host: str, port: int, path: str, obj: dict, timeout: float = 10.0) -> tuple:
+    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    code, raw = peer_request(host, port, path, body, timeout=timeout)
+    return code, _json_or_empty(raw), len(body) + len(raw)
+
+
+# ---- v8.24.0: quiet mesh (pairing, private beacons, stealth :5005). Crypto lives in omni_quiet_mesh.py ----
+PAIRED_LIVE_TTL = 90.0          # a paired device counts as connected this long after its last good contact
+CLIENT_RETRY_S = 30.0           # after a failed handshake, don't try that address again for this long
+PAIR_SEEK_S = 15.0              # accept-by-code waits this long to hear a "pairing open" beacon
+PAIR_BODY_MAX = 8 * 1024
+
+
+class PeerUnavailable(OSError):
+    pass
+
+
+class PairWrongCode(Exception):
+    def __init__(self, attempts_left=None):
+        super().__init__("wrong code")
+        self.attempts_left = attempts_left
+
+
+class PairLocked(Exception):
+    pass
+
+
+def quiet_active() -> bool:
+    """Quiet once paired (auto), always (on), never (off)."""
+    mode = STATE.quiet_mode
+    return mode == "on" or (mode == "auto" and len(STATE.paired) > 0)
+
+def pair_offer_active() -> bool:
+    o = STATE.pair_offer
+    return o is not None and o.active() and STATE.quiet_mode != "off"
+
+def quiet_status() -> dict:
+    o = STATE.pair_offer
+    return {"mode": STATE.quiet_mode, "active": quiet_active(), "paired": len(STATE.paired),
+            "online": len(paired_live_peers()), "offer_open": pair_offer_active(),
+            "offer_expires_in": o.expires_in() if o is not None and pair_offer_active() else 0,
+            "counts": _quiet_counts()}
+
+def _quiet_counts() -> dict:
+    counts, _ = TELEMETRY.snapshot()
+    keys = ("quiet_beacons_sent", "quiet_beacons_matched", "quiet_beacons_unmatched", "beacons_ignored_quiet",
+            "p2p_quiet_dropped", "p2p_rate_limited", "p2p_auth_ok", "p2p_auth_failed", "p2p_session_requests",
+            "pair_wrong_code", "pair_open_beacons_sent")
+    out = {k: counts.get(k, 0) for k in keys}
+    now = time.time()
+    with STATE.p2p_gate.lock:
+        out["blocked_ips"] = sum(1 for t in STATE.p2p_gate.blocked.values() if t > now)
+    return out
+
+def _sign(data: bytes) -> str:
+    return STATE.signing_key.sign(data).hex()
+
+def _bare(ip: str) -> str:
+    ip = str(ip or "").split("%", 1)[0]
+    return ip[7:] if ip.startswith("::ffff:") else ip
+
+def is_self_addr(host: str, port: int) -> bool:
+    return int(port) == P2P_SYNC_PORT and _bare(host) in ("127.0.0.1", "::1", "localhost", LOCAL_IP)
+
+def paired_live_peers() -> list:
+    now = time.time()
+    with STATE.lock:
+        return [(v["host"], v["port"]) for v in STATE.paired_live.values() if now - v["last_seen"] < PAIRED_LIVE_TTL]
+
+def mark_paired_live(pubkey: str, host: str, port: int):
+    with STATE.lock:
+        old = STATE.paired_live.get(pubkey)
+        is_new = old is None or time.time() - old["last_seen"] >= PAIRED_LIVE_TTL
+        STATE.paired_live[pubkey] = {"host": host, "port": int(port), "last_seen": time.time()}
+    STATE.paired.touch(pubkey, host, port)
+    if is_new:
+        TELEMETRY.inc("paired_peer_connected")
+        STATE.catchup_wake.set()
+
+def paired_dial_targets() -> list:
+    """Addresses to try for paired devices: where they were last seen live, else their last known address."""
+    out = list(paired_live_peers())
+    for e in STATE.paired.entries():
+        if e["host"] and (e["host"], e["port"]) not in out and not is_self_addr(e["host"], e["port"]):
+            out.append((e["host"], e["port"]))
+    return out
+
+def _paired_for_addr(host: str, port: int):
+    for e in STATE.paired.entries():
+        if e["host"] == host and e["port"] == int(port):
+            return e
+    with STATE.lock:
+        live = {pk: v for pk, v in STATE.paired_live.items()}
+    for pk, v in live.items():
+        if v["host"] == host and v["port"] == int(port):
+            return STATE.paired.get(pk)
+    return None
+
+def on_paired(pubkey: str, name: str):
+    if STATE.trusted_keys is not None:
+        STATE.trusted_keys.add(pubkey)
+    TELEMETRY.inc("pairings_made")
+    print(f"[✓] Paired with {name} (·{pubkey[:4]}). Quiet mode: {'on' if quiet_active() else 'off'}", flush=True)
+    STATE.catchup_wake.set()
+
+def unpair(pubkey: str) -> bool:
+    if not STATE.paired.remove(pubkey):
+        return False
+    if STATE.trusted_keys is not None and (STATE.file_trusted_keys is None or pubkey not in STATE.file_trusted_keys) \
+            and pubkey != STATE.node_id:
+        STATE.trusted_keys.discard(pubkey)
+    with STATE.lock:
+        STATE.paired_live.pop(pubkey, None)
+        STATE.sessions_srv = {k: v for k, v in STATE.sessions_srv.items() if v["peer"] != pubkey}
+        STATE.sessions_cli = {k: v for k, v in STATE.sessions_cli.items() if v["peer"] != pubkey}
+    TELEMETRY.inc("pairings_removed")
+    return True
+
+
+# -- beacons in
+
+def handle_quiet_beacon(packet: bytes, ip: str):
+    """A 48-byte quiet beacon. Returns the paired entry it matched, or None (strangers' and our own)."""
+    if not quiet_active():
+        return None
+    nonce = bytes(packet[:qm.NONCE_LEN])
+    if nonce in STATE.own_beacon_nonces:
+        return None
+    with STATE.lock:
+        if nonce in STATE.beacon_nonces_seen:
+            return None
+        STATE.beacon_nonces_seen[nonce] = time.time()
+        while len(STATE.beacon_nonces_seen) > 4096:
+            STATE.beacon_nonces_seen.popitem(last=False)
+    entry = qm.match_beacon(packet, STATE.paired.entries())
+    if entry is None:
+        TELEMETRY.inc("quiet_beacons_unmatched")
+        return None
+    TELEMETRY.inc("quiet_beacons_matched")
+    pk, port = entry["pubkey"], entry["port"]
+    with STATE.lock:
+        live = STATE.paired_live.get(pk)
+        fresh = live and live["host"] == ip and time.time() - live["last_seen"] < PAIRED_LIVE_TTL
+        if fresh:
+            live["last_seen"] = time.time()
+    if not fresh:
+        # Only an authenticated handshake makes it a live peer: a replayed beacon gets nobody in.
+        threading.Thread(target=_connect_paired, args=(ip, port), daemon=True).start()
+    return entry
+
+def _connect_paired(host: str, port: int):
+    try:
+        client_session(host, port, force=True)
+    except Exception:
+        TELEMETRY.inc("paired_connect_failed")
+
+def note_pair_open(msg: dict, ip: str):
+    try:
+        port = int(msg.get("port", P2P_SYNC_PORT))
+    except (TypeError, ValueError):
+        return
+    if not 0 < port < 65536 or is_self_addr(ip, port):
+        return
+    with STATE.lock:
+        if len(STATE.pair_open_seen) > 256:
+            STATE.pair_open_seen.clear()
+        STATE.pair_open_seen[ip] = (port, time.time())
+
+
+# -- client side: our signed session at a peer
+
+def client_session(host: str, port: int, force: bool = False) -> dict:
+    key = (host, int(port))
+    now = time.time()
+    with STATE.lock:
+        s = STATE.sessions_cli.get(key)
+        if s and s["exp"] > now:
+            return s
+        if not force and STATE.cli_backoff.get(key, 0) > now:
+            raise PeerUnavailable(f"{host}:{port}: waiting before trying again")
+    try:
+        s = _client_handshake(host, int(port))
+    except Exception as e:
+        with STATE.lock:
+            STATE.cli_backoff[key] = time.time() + CLIENT_RETRY_S
+        TELEMETRY.inc("p2p_auth_client_failed")
+        raise PeerUnavailable(f"{host}:{port}: no signed session ({type(e).__name__})")
+    with STATE.lock:
+        STATE.sessions_cli[key] = s
+        STATE.cli_backoff.pop(key, None)
+    if s.get("paired"):
+        mark_paired_live(s["peer"], host, port)
+    return s
+
+def _client_handshake(host: str, port: int) -> dict:
+    entries = STATE.paired.entries()
+    known = _paired_for_addr(host, port)
+    allowlist = STATE.file_trusted_keys is not None and known is None
+    if not entries and not allowlist:
+        raise PeerUnavailable("no paired or allowlisted key to sign in with")
+    nc = secrets.token_bytes(16)
+    esk, ec = qm.x25519_pair()
+    ts = now_ms()
+    hello = {"nc": qm.b64u(nc), "ec": qm.b64u(ec), "ts": ts}
+    if allowlist:   # OMNI_TRUSTED_KEYS_FILE peers: a signed hello (this shows our pubkey to that host)
+        hello.update(pk=STATE.node_id, sig=_sign(qm.auth_sig_bytes("hello", qm._sha(nc, ec, ts))))
+    if entries:     # paired: MACs only, nothing that names us
+        hello["m"] = qm.hello_macs([known] if known else entries, nc, ec, ts)
+    code, raw = _raw_post(host, port, "/p2p/auth", json.dumps(hello).encode("utf-8"), {}, timeout=6.0)
+    r1 = _json_or_empty(raw)
+    if code != 200:
+        raise PeerUnavailable(f"/p2p/auth answered {code}")
+    sid, ns, es = str(r1.get("sid", "")), qm.unb64u(r1.get("ns", ""), 16), qm.unb64u(r1.get("es", ""), 32)
+    th = qm.auth_transcript(nc, ec, ts, ns, es, sid)
+    entry = None
+    if r1.get("m"):
+        m = qm.unb64u(r1["m"], 32)
+        for e in ([known] if known else entries):
+            if qm.eq(qm.auth_server_mac(qm.auth_key(e["mesh_key"]), th), m):
+                entry = e
+                break
+        if entry is None:
+            raise PeerUnavailable("server didn't prove a paired key")
+    code, raw = _raw_post(host, port, "/p2p/auth", json.dumps(
+        {"sid": sid, "sig": _sign(qm.auth_sig_bytes("client", th))}).encode("utf-8"), {}, timeout=6.0)
+    r2 = _json_or_empty(raw)
+    if code != 200:
+        raise PeerUnavailable(f"/p2p/auth step 2 answered {code}")
+    server_pk = entry["pubkey"] if entry else str(r2.get("pk", ""))
+    if entry is None and not (STATE.file_trusted_keys is not None and server_pk in STATE.file_trusted_keys):
+        raise PeerUnavailable("server key is not on our allowlist")
+    if not qm.ed25519_verify(server_pk, str(r2.get("sig", "")), qm.auth_sig_bytes("server", th)):
+        raise PeerUnavailable("bad server proof")
+    dh = qm.x25519_shared(esk, es)
+    sk = qm.session_key(entry["mesh_key"] if entry else b"", dh, th)
+    ttl = min(float(r2.get("ttl") or qm.SESSION_TTL_S), qm.SESSION_TTL_S)
+    return {"sid": sid, "sk": sk, "ctr": 0, "exp": time.time() + ttl - 30.0, "peer": server_pk,
+            "paired": entry is not None, "lock": threading.Lock()}
+
+def peer_request(host: str, port: int, path: str, body: bytes, timeout: float = 10.0) -> tuple:
+    """POST to a peer's :5005. Quiet mode: inside our signed session (one fresh handshake if the peer
+    dropped it). Otherwise the pre-8.24 request with the mesh header. Returns (status, raw body)."""
+    if not quiet_active():
+        return _raw_post(host, port, path, body, {MESH_HEADER: STATE.mesh_id}, timeout)
+    for attempt in (0, 1):
+        s = client_session(host, port, force=attempt == 1)
+        with s["lock"]:
+            s["ctr"] += 1
+            ctr = s["ctr"]
+        hdr = qm.session_header(s["sk"], s["sid"], ctr, "POST", path, body)
         try:
-            return e.code, json.loads(raw), len(body) + len(raw)
-        except ValueError:
-            return e.code, {}, len(body) + len(raw)
+            code, raw = _raw_post(host, port, path, body, {qm.SESSION_HEADER: hdr}, timeout)
+            if s.get("paired"):
+                with STATE.lock:
+                    live = STATE.paired_live.get(s["peer"])
+                    if live:
+                        live["last_seen"] = time.time()
+            return code, raw
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            with STATE.lock:
+                if STATE.sessions_cli.get((host, int(port))) is s:
+                    STATE.sessions_cli.pop((host, int(port)), None)
+            if attempt == 1:
+                raise
+    raise PeerUnavailable("unreachable")
+
+
+# -- server side: /p2p/auth and session checks
+
+def _prune_auth_state(now: float):
+    STATE.handshakes = {k: v for k, v in STATE.handshakes.items() if v["exp"] > now}
+    STATE.sessions_srv = {k: v for k, v in STATE.sessions_srv.items() if v["exp"] > now}
+    if len(STATE.auth_nonces) > 8192:
+        cutoff = now - qm.AUTH_TS_WINDOW_MS / 1000.0 * 2
+        STATE.auth_nonces = {k: t for k, t in STATE.auth_nonces.items() if t > cutoff}
+
+def answer_auth(data, ip: str):
+    """Server side of POST /p2p/auth. Returns the JSON answer, or None: the caller then closes the
+    connection without a byte (and counts a failure for that IP)."""
+    if not isinstance(data, dict):
+        return None
+    now = time.time()
+    try:
+        if "sid" in data and "nc" not in data:
+            sid = str(data.get("sid", ""))
+            with STATE.lock:
+                hs = STATE.handshakes.pop(sid, None)
+            if hs is None or hs["exp"] < now or hs["ip"] != ip:
+                return None
+            if not qm.ed25519_verify(hs["peer"], str(data.get("sig", "")), qm.auth_sig_bytes("client", hs["th"])):
+                return None
+            sk = qm.session_key(hs["mk"] or b"", hs["dh"], hs["th"])
+            with STATE.lock:
+                _prune_auth_state(now)
+                if len(STATE.sessions_srv) > 1024:
+                    return None
+                STATE.sessions_srv[sid] = {"peer": hs["peer"], "sk": sk, "ip": ip, "exp": now + qm.SESSION_TTL_S,
+                                           "ctrs": set(), "max": 0, "paired": hs["mk"] is not None}
+            if hs["mk"] is not None:
+                e = STATE.paired.get(hs["peer"])
+                if e:
+                    mark_paired_live(hs["peer"], ip, e["port"])
+            TELEMETRY.inc("p2p_auth_ok")
+            return {"status": "OK", "pk": STATE.node_id, "sig": _sign(qm.auth_sig_bytes("server", hs["th"])),
+                    "ttl": int(qm.SESSION_TTL_S)}
+        nc, ec = qm.unb64u(data.get("nc", ""), 16), qm.unb64u(data.get("ec", ""), 32)
+        ts = data.get("ts")
+        if not isinstance(ts, int) or isinstance(ts, bool) or abs(now_ms() - ts) > qm.AUTH_TS_WINDOW_MS:
+            return None
+        with STATE.lock:
+            if nc in STATE.auth_nonces:
+                return None
+            STATE.auth_nonces[nc] = now
+        peer, mk, ak = None, None, None
+        macs = data.get("m")
+        if isinstance(macs, list) and 0 < len(macs) <= qm.MAX_PAIRED and len(macs) % qm.MAC_SLOTS == 0:
+            got = [qm.unb64u(m, 32) for m in macs if isinstance(m, str)]
+            for e in STATE.paired.entries():
+                k = qm.auth_key(e["mesh_key"])
+                want = qm.auth_hello_mac(k, nc, ec, ts)
+                if any(qm.eq(want, g) for g in got):
+                    peer, mk, ak = e["pubkey"], e["mesh_key"], k
+                    break
+        if peer is None and data.get("pk") and STATE.file_trusted_keys is not None:
+            pk = str(data.get("pk"))
+            if pk in STATE.file_trusted_keys and qm.ed25519_verify(
+                    pk, str(data.get("sig", "")), qm.auth_sig_bytes("hello", qm._sha(nc, ec, ts))):
+                peer = pk
+        if peer is None or peer == STATE.node_id:
+            return None
+        ns, sid = secrets.token_bytes(16), secrets.token_hex(16)
+        esk, es = qm.x25519_pair()
+        th = qm.auth_transcript(nc, ec, ts, ns, es, sid)
+        dh = qm.x25519_shared(esk, ec)
+        with STATE.lock:
+            _prune_auth_state(now)
+            if len(STATE.handshakes) > 256:
+                return None
+            STATE.handshakes[sid] = {"peer": peer, "mk": mk, "th": th, "dh": dh, "ip": ip,
+                                     "exp": now + qm.HANDSHAKE_TTL_S}
+        out = {"status": "OK", "sid": sid, "ns": qm.b64u(ns), "es": qm.b64u(es)}
+        if ak is not None:
+            out["m"] = qm.b64u(qm.auth_server_mac(ak, th))
+        return out
+    except (ValueError, TypeError):
+        return None
+
+def verify_session(header_value, ip: str, method: str, path: str, body: bytes):
+    """The session a request's X-Omni-Session header proves, or None."""
+    parsed = qm.parse_session_header(header_value)
+    if parsed is None:
+        return None
+    sid, ctr, mac = parsed
+    with STATE.lock:
+        s = STATE.sessions_srv.get(sid)
+        if s is None or s["exp"] < time.time() or s["ip"] != ip:
+            return None
+        if ctr <= 0 or ctr in s["ctrs"] or ctr < s["max"] - 512:
+            return None
+        if not hmac.compare_digest(qm.request_mac(s["sk"], sid, ctr, method, path, body), mac):
+            return None
+        s["ctrs"].add(ctr)
+        s["max"] = max(s["max"], ctr)
+        if len(s["ctrs"]) > 1024:
+            s["ctrs"] = {c for c in s["ctrs"] if c >= s["max"] - 512}
+        peer = s["peer"]
+        if s["paired"] and peer in STATE.paired_live:
+            STATE.paired_live[peer]["last_seen"] = time.time()
+    return {"peer": peer, "sid": sid}
+
+
+# -- pairing: offer (loopback API) and exchange (:5005 while an offer is open)
+
+def pair_offer_create(data) -> tuple:
+    if STATE.quiet_mode == "off":
+        return {"status": "ERROR", "message": f"Pairing is off on this node ({qm.MODE_ENV}=off)"}, 409
+    ttl = qm.OFFER_TTL_DEFAULT
+    if isinstance(data, dict) and data.get("ttl_s") is not None:
+        try:
+            ttl = int(data["ttl_s"])
+        except (TypeError, ValueError):
+            return {"status": "ERROR", "message": "ttl_s must be a number of seconds"}, 400
+        ttl = max(qm.OFFER_TTL_MIN, min(qm.OFFER_TTL_MAX, ttl))
+    offer = qm.PairOffer(ttl)
+    STATE.pair_offer = offer            # one offer at a time: a new one replaces the old
+    addrs = [f"{ip}:{P2P_SYNC_PORT}" for ip in qm.private_addresses(LOCAL_IP)]
+    ts_ip = tailscale_ip()
+    if ts_ip:
+        addrs.append(f"{ts_ip}:{P2P_SYNC_PORT}")
+    if not addrs and LOCAL_IP != "127.0.0.1":
+        addrs.append(f"{LOCAL_IP}:{P2P_SYNC_PORT}")
+    payload = qm.offer_payload(STATE.node_id, offer.mesh_key, offer.code, addrs, qm.node_name())
+    offer.payload, offer.addrs = payload, addrs
+    TELEMETRY.inc("pair_offers")
+    return pair_offer_view(), 200
+
+def pair_offer_view() -> dict:
+    o = STATE.pair_offer
+    if o is None or not o.active():
+        why = "none"
+        if o is not None:
+            why = "paired" if o.used_by else ("locked" if o.locked else "expired")
+        return {"status": "OK", "active": False, "ended": why}
+    return {"status": "OK", "active": True, "code": o.code, "payload": getattr(o, "payload", ""),
+            "addresses": getattr(o, "addrs", []), "expires_in": o.expires_in(), "attempts_left": o.attempts_left(),
+            "port": P2P_SYNC_PORT}
+
+def pair_offer_cancel() -> tuple:
+    STATE.pair_offer = None
+    return {"status": "OK", "active": False}, 200
+
+def answer_pair(data, ip: str) -> tuple:
+    """Server side of POST /p2p/pair (only reachable while an offer is open)."""
+    offer = STATE.pair_offer
+    if offer is None or not offer.active():
+        return {"status": "ERROR", "message": "no pairing offer is open"}, 410
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    now = time.time()
+    try:
+        if data.get("step") == 1:
+            mode = data.get("mode")
+            if mode not in ("code", "qr"):
+                return {"status": "ERROR", "message": "mode must be code or qr"}, 400
+            eb, nb = qm.unb64u(data.get("eb", ""), 32), qm.unb64u(data.get("nb", ""), 16)
+            esk, ea = qm.x25519_pair()
+            na, sid = secrets.token_bytes(16), secrets.token_hex(16)
+            with offer.lock:
+                offer.sessions = {k: v for k, v in offer.sessions.items() if v["exp"] > now}
+                if len(offer.sessions) >= qm.PAIR_MAX_SESSIONS:
+                    return {"status": "ERROR", "message": "too many pairing attempts at once"}, 429
+                offer.sessions[sid] = {"mode": mode, "eb": eb, "nb": nb, "esk": esk, "ea": ea, "na": na,
+                                       "ip": ip, "exp": now + 60.0}
+            return {"status": "OK", "sid": sid, "ea": qm.b64u(ea), "na": qm.b64u(na), "salt": qm.b64u(offer.salt),
+                    "iters": qm.PBKDF2_ITERS}, 200
+        if data.get("step") != 2:
+            return {"status": "ERROR", "message": "step must be 1 or 2"}, 400
+        sid = str(data.get("sid", ""))
+        with offer.lock:
+            ps = offer.sessions.pop(sid, None)
+        if ps is None or ps["exp"] < now or ps["ip"] != ip:
+            return {"status": "ERROR", "message": "pairing session expired; start again"}, 400
+        th = qm.pair_transcript(ps["mode"], ps["eb"], ps["nb"], ps["ea"], ps["na"], offer.salt, sid)
+        dh = qm.x25519_shared(ps["esk"], ps["eb"])
+        k_mac, k_enc = qm.pair_keys(offer.secret(ps["mode"]), dh, th)
+        pk, name = str(data.get("pk", "")), qm.clean_name(data.get("name"))
+        port = int(data.get("port") or P2P_SYNC_PORT)
+        if not 0 < port < 65536:
+            return {"status": "ERROR", "message": "bad port"}, 400
+        if not qm.eq(qm.pair_mac(k_mac, "B", th, pk, port, name), qm.unb64u(data.get("mac", ""), 32)):
+            with offer.lock:
+                offer.attempts += 1
+                if offer.attempts >= qm.PAIR_MAX_ATTEMPTS:
+                    offer.locked = True
+            STATE.p2p_gate.fail(ip)
+            TELEMETRY.inc("pair_wrong_code")
+            if offer.locked:
+                print("[!] Pairing offer locked after too many wrong codes. Make a new one.", flush=True)
+                return {"status": "ERROR", "message": "too many wrong codes; make a new code", "locked": True}, 410
+            return {"status": "ERROR", "message": "wrong code", "attempts_left": offer.attempts_left()}, 403
+        if not qm.is_pubkey(pk) or pk == STATE.node_id or \
+                not qm.ed25519_verify(pk, str(data.get("sig", "")), qm.pair_sig_bytes("B", th, pk)):
+            return {"status": "ERROR", "message": "bad device signature"}, 400
+        with offer.lock:
+            if not offer.active():
+                return {"status": "ERROR", "message": "this offer was just used or ended"}, 410
+            offer.used_by = pk
+        STATE.paired.add(pk, offer.mesh_key, name, _bare(ip), port)
+        on_paired(pk, name)
+        my_name = qm.node_name()
+        return {"status": "OK", "pk": STATE.node_id, "port": P2P_SYNC_PORT, "name": my_name,
+                "sig": _sign(qm.pair_sig_bytes("A", th, STATE.node_id)),
+                "mac": qm.b64u(qm.pair_mac(k_mac, "A", th, STATE.node_id, P2P_SYNC_PORT, my_name)),
+                "box": qm.seal(k_enc, offer.mesh_key, th)}, 200
+    except (ValueError, TypeError) as e:
+        return {"status": "ERROR", "message": f"bad pairing message: {e}"}, 400
+
+def _pair_exchange(host: str, port: int, mode: str, code: str, qr: dict = None) -> dict:
+    """Client side of /p2p/pair. Returns the stored entry. Raises PairWrongCode / PairLocked / OSError."""
+    esk, eb = qm.x25519_pair()
+    nb = secrets.token_bytes(16)
+    c1, raw = _raw_post(host, port, "/p2p/pair", json.dumps(
+        {"step": 1, "mode": mode, "eb": qm.b64u(eb), "nb": qm.b64u(nb)}).encode("utf-8"), {}, timeout=10.0)
+    r1 = _json_or_empty(raw)
+    if c1 != 200:
+        raise OSError(f"{host}:{port} has no open pairing offer ({c1})")
+    sid = str(r1.get("sid", ""))
+    ea, na, salt = qm.unb64u(r1.get("ea", ""), 32), qm.unb64u(r1.get("na", ""), 16), qm.unb64u(r1.get("salt", ""), 16)
+    iters = int(r1.get("iters") or 0)
+    if not 50_000 <= iters <= 2_000_000:
+        raise OSError("the other device asked for an unsafe key setting")
+    th = qm.pair_transcript(mode, eb, nb, ea, na, salt, sid)
+    secret = qm.pair_secret(mode, salt, code, qr["mesh_key"] if qr else None, iters)
+    k_mac, k_enc = qm.pair_keys(secret, qm.x25519_shared(esk, ea), th)
+    name = qm.node_name()
+    c2, raw = _raw_post(host, port, "/p2p/pair", json.dumps(
+        {"step": 2, "sid": sid, "pk": STATE.node_id, "port": P2P_SYNC_PORT, "name": name,
+         "sig": _sign(qm.pair_sig_bytes("B", th, STATE.node_id)),
+         "mac": qm.b64u(qm.pair_mac(k_mac, "B", th, STATE.node_id, P2P_SYNC_PORT, name))}).encode("utf-8"),
+        {}, timeout=15.0)
+    r2 = _json_or_empty(raw)
+    if c2 == 403:
+        raise PairWrongCode(r2.get("attempts_left"))
+    if c2 == 410:
+        raise PairLocked() if r2.get("locked") else OSError("that offer ended")
+    if c2 != 200:
+        raise OSError(f"pairing answered {c2}: {str(r2.get('message', ''))[:80]}")
+    pk, their_port, their_name = str(r2.get("pk", "")), int(r2.get("port") or 0), qm.clean_name(r2.get("name"))
+    if not qm.is_pubkey(pk) or not 0 < their_port < 65536:
+        raise OSError("bad answer from the other device")
+    if not qm.eq(qm.pair_mac(k_mac, "A", th, pk, their_port, their_name), qm.unb64u(r2.get("mac", ""), 32)):
+        raise OSError("the other device couldn't prove it knows the code")
+    if not qm.ed25519_verify(pk, str(r2.get("sig", "")), qm.pair_sig_bytes("A", th, pk)):
+        raise OSError("bad signature from the other device")
+    if qr and pk != qr["pubkey"]:
+        raise OSError("the device that answered isn't the one in the QR code")
+    mk = qm.unseal(k_enc, str(r2.get("box", "")), th)
+    if len(mk) != 32 or (qr and mk != qr["mesh_key"]):
+        raise OSError("bad mesh key from the other device")
+    entry = STATE.paired.add(pk, mk, their_name, host, their_port)
+    on_paired(pk, their_name)
+    return entry
+
+def _pair_targets_heard(wait_s: float) -> list:
+    deadline = time.time() + wait_s
+    while True:
+        now = time.time()
+        with STATE.lock:
+            heard = sorted(((t, ip, port) for ip, (port, t) in STATE.pair_open_seen.items() if now - t < 10.0),
+                           reverse=True)
+        if heard or now >= deadline:
+            return [(ip, port) for _, ip, port in heard]
+        time.sleep(0.5)
+
+def pair_accept(data) -> tuple:
+    if STATE.quiet_mode == "off":
+        return {"status": "ERROR", "message": f"Pairing is off on this node ({qm.MODE_ENV}=off)"}, 409
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    targets = []
+    if data.get("host"):
+        host, port = qm.split_hostport(str(data["host"]), int(data.get("port") or 5005))
+        if not host:
+            return {"status": "ERROR", "message": "that address doesn't look right"}, 400
+        targets = [(host, port)]
+    qr = None
+    try:
+        if data.get("payload"):
+            qr = qm.parse_payload(data["payload"])
+            mode, code = "qr", qr["code"]
+            targets = targets or qr["addrs"]
+        else:
+            mode, code = "code", qm.normalize_code(data.get("code"))
+    except ValueError as e:
+        return {"status": "ERROR", "message": str(e)}, 400
+    if not targets:
+        targets = _pair_targets_heard(PAIR_SEEK_S)
+    if not targets:
+        return {"status": "ERROR", "message": "No device nearby is showing a pairing code. Check both are on "
+                                              "the same Wi-Fi, or type the other device's address."}, 404
+    last = "couldn't reach the other device"
+    for host, port in targets[:6]:
+        try:
+            entry = _pair_exchange(host, port, mode, code, qr)
+            return {"status": "OK", "peer": qm.public_view(entry, online=False)}, 200
+        except PairWrongCode as e:
+            return {"status": "ERROR", "message": "That code didn't match.", "attempts_left": e.attempts_left}, 403
+        except PairLocked:
+            return {"status": "ERROR", "message": "Too many wrong codes. Make a new code on the other device."}, 410
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as e:
+            last = str(e)[:160]
+    return {"status": "ERROR", "message": f"Couldn't pair: {last}"}, 502
+
+def pair_list() -> dict:
+    live = {pk for pk, v in dict(STATE.paired_live).items() if time.time() - v["last_seen"] < PAIRED_LIVE_TTL}
+    peers = [qm.public_view(e, e["pubkey"] in live) for e in STATE.paired.entries()]
+    peers.sort(key=lambda p: -p["paired_at"])
+    return {"status": "OK", "quiet": quiet_status(), "peers": peers}
+
+def pair_remove(data) -> tuple:
+    pk = str((data or {}).get("pubkey", "")).strip().lower() if isinstance(data, dict) else ""
+    if not qm.is_pubkey(pk):
+        return {"status": "ERROR", "message": "pubkey must be 64 hex characters"}, 400
+    if not unpair(pk):
+        return {"status": "ERROR", "message": "not a paired device"}, 404
+    return {"status": "OK", "removed": pk, "quiet": quiet_status()}, 200
 
 def reconcile_with_peer(host: str, port: int) -> dict:
     """Client side of one catch-up: reconcile, pull what we lack (verified), push what they lack."""
@@ -3605,8 +4317,12 @@ class TelemetryHandler(BaseHTTPRequestHandler):
             with STATE.lock:
                 now = time.time()
                 STATE.active_peers = {k: v for k, v in STATE.active_peers.items() if now - v["last_seen"] < 15.0}
-                active_count = len(STATE.active_peers)
                 peer_ips = list(STATE.active_peers.keys())
+                for v in STATE.paired_live.values():      # v8.24.0: paired devices count as nearby peers
+                    if now - v["last_seen"] < PAIRED_LIVE_TTL and v["host"] not in peer_ips:
+                        peer_ips.append(v["host"])
+                active_count = len(STATE.active_peers) + sum(
+                    1 for v in STATE.paired_live.values() if now - v["last_seen"] < PAIRED_LIVE_TTL)
                 uptime = round(now - STATE.start_time, 1)
 
             resp_data = {
@@ -3624,6 +4340,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "relay": relay_status() if RELAY is not None else {"enabled": False},
                 "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
+                "quiet": quiet_status(),
             }
             body = json.dumps(resp_data).encode("utf-8")
             self.send_response(200)
@@ -3775,6 +4492,13 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
         # Loopback: open as before. Non-loopback: remote hub on + bearer token, else 403/401.
         if not remote_gate(self, "GET", path):
             return
+        if path in ("/api/pair/list", "/api/pair/offer"):
+            # v8.24.0, loopback only (plus the local token when the node runs with OMNI_LOCAL_TOKEN=1).
+            if not _is_loopback(self.client_address[0]):
+                _deny(self, 403, "loopback only")
+                return
+            self._send_json(200, pair_list() if path == "/api/pair/list" else pair_offer_view())
+            return
         if path == "/api/sync/peers":
             peers = [{"host": h, "port": p, "transport": v["transport"], "node_hash": v["node_hash"],
                       "age_s": round(time.time() - v["last_seen"], 1)} for h, p, v in radio_peers_fresh()]
@@ -3897,6 +4621,30 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
                 resp, status = add_radio_peer(data)
                 self._send_json(status, resp)
             return
+        if self.path in ("/api/pair/offer", "/api/pair/cancel", "/api/pair/accept", "/api/pair/remove"):
+            # v8.24.0 pairing. Loopback only (never in REMOTE_POST_PATHS), plus the local token when on.
+            if not _is_loopback(self.client_address[0]):
+                _deny(self, 403, "loopback only")
+                return
+            try:
+                raw = read_request_body(self, 16 * 1024)
+                data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+            except BodyError as e:
+                self._send_json(e.status, {"status": "ERROR", "message": e.message})
+                return
+            except (ValueError, UnicodeDecodeError):
+                self._send_json(400, {"status": "ERROR", "message": "body must be valid UTF-8 JSON"})
+                return
+            if self.path == "/api/pair/offer":
+                resp, status = pair_offer_create(data)
+            elif self.path == "/api/pair/cancel":
+                resp, status = pair_offer_cancel()
+            elif self.path == "/api/pair/accept":
+                resp, status = pair_accept(data)
+            else:
+                resp, status = pair_remove(data)
+            self._send_json(status, resp)
+            return
         if self.path == "/api/relay/config":
             # Loopback-only (never in REMOTE_POST_PATHS): Omni Node turns the phone relay on/off and caps it.
             if not _is_loopback(self.client_address[0]):
@@ -3998,8 +4746,93 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Endpoint Not Found")
 
 class P2PSyncHandler(BaseHTTPRequestHandler):
+    _session = None     # set once a request proves a signed session (quiet mode, v8.24.0)
+
     def log_message(self, format, *args):
         return
+
+    # ---- v8.24.0 quiet mode: unknown callers get the connection closed without a single byte
+    def _quiet(self) -> bool:
+        return quiet_active() and self._session is None
+
+    def _silent(self, fail: bool = True):
+        """Close without answering: no status line, no Server banner, no body."""
+        self.close_connection = True
+        if fail:
+            STATE.p2p_gate.fail(_bare(self.client_address[0]))
+        TELEMETRY.inc("p2p_quiet_dropped")
+
+    def send_error(self, code, message=None, explain=None):
+        if self._quiet():
+            self._silent()
+            return
+        super().send_error(code, message, explain)
+
+    def _mesh_ok(self, their_mesh) -> bool:
+        if self._session is not None:
+            return True     # a signed session replaces the mesh header
+        return their_mesh is not None and their_mesh.strip() == STATE.mesh_id
+
+    def _known_peer(self, ip: str) -> bool:
+        return self._session is not None or catchup_peer_allowed(ip)
+
+    def _read_capped(self, max_bytes: int):
+        try:
+            n = int(self.headers.get("Content-Length", "") or -1)
+        except ValueError:
+            return None
+        if n < 0 or n > max_bytes or (self.headers.get("Transfer-Encoding") or "").strip():
+            return None
+        data = self.rfile.read(n) if n else b""
+        return data if len(data) == n else None
+
+    def _handle_pair(self):
+        raw = self._read_capped(PAIR_BODY_MAX)
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, UnicodeDecodeError):
+            data = None
+        resp, code = answer_pair(data, _bare(self.client_address[0]))
+        self._json_reply(code, resp)
+
+    def _handle_auth(self):
+        ip = _bare(self.client_address[0])
+        raw = self._read_capped(PAIR_BODY_MAX)
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, UnicodeDecodeError):
+            data = None
+        resp = answer_auth(data, ip)
+        if resp is None:
+            TELEMETRY.inc("p2p_auth_failed")
+            self._silent()
+            return
+        STATE.p2p_gate.ok(ip)
+        self._json_reply(200, resp)
+
+    def handle_one_request(self):
+        self._session = None
+        super().handle_one_request()
+
+    def do_POST(self):
+        self._session = None
+        if self.path == "/p2p/pair" and pair_offer_active():
+            self._handle_pair()      # reachable only while an offer shows
+            return
+        if quiet_active():
+            if self.path == "/p2p/auth":
+                self._handle_auth()
+                return
+            body = self._read_capped(MAX_PAYLOAD_SIZE)
+            sess = None if body is None else verify_session(self.headers.get(qm.SESSION_HEADER),
+                                                            _bare(self.client_address[0]), "POST", self.path, body)
+            if sess is None:
+                self._silent()
+                return
+            self._session = sess
+            self.rfile = io.BytesIO(body)       # the handlers below read the body as before
+            TELEMETRY.inc("p2p_session_requests")
+        self._dispatch_post()
 
     def reject_mesh(self, their_mesh):
         """403 before any parsing/verification/storage. The body is drained unread (capped) so the
@@ -4038,11 +4871,11 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         """v8.21.0 peer endpoints. Mesh header first; hello is open to any same-mesh node (signed),
         the rest only to known peers (discovered, OMNI_SYNC_PEERS, radio/manual, or a fresh hello)."""
         their_mesh = self.headers.get(MESH_HEADER)
-        if their_mesh is None or their_mesh.strip() != STATE.mesh_id:
+        if not self._mesh_ok(their_mesh):
             self.reject_mesh(their_mesh)
             return
         ip = self.client_address[0]
-        if self.path != "/p2p/hello" and not catchup_peer_allowed(ip):
+        if self.path != "/p2p/hello" and not self._known_peer(ip):
             _deny(self, 403, "say /p2p/hello first (signed by your node key)")
             return
         try:
@@ -4071,15 +4904,15 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
                 {"status": "ERROR", "message": "'query' must be the signed poll query string"}, 400)
         self._json_reply(code, resp)
 
-    def do_POST(self):
+    def _dispatch_post(self):
         if self.path in ("/p2p/reconcile", "/p2p/events"):
             # Catch-up sync (v8.8.0). Mesh first (403, unread), then only loopback / known peers (403):
             # the same hosts live relay already pushes every event to. Nothing here writes to the DB.
             their_mesh = self.headers.get(MESH_HEADER)
-            if their_mesh is None or their_mesh.strip() != STATE.mesh_id:
+            if not self._mesh_ok(their_mesh):
                 self.reject_mesh(their_mesh)
                 return
-            if not catchup_peer_allowed(self.client_address[0]):
+            if not self._known_peer(self.client_address[0]):
                 TELEMETRY.inc("catchup_denied_unknown_peer")
                 _deny(self, 403, "catch-up is only served to known peers on this mesh")
                 return
@@ -4108,7 +4941,7 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/p2p/sync":
             their_mesh = self.headers.get(MESH_HEADER)
-            if their_mesh is None or their_mesh.strip() != STATE.mesh_id:
+            if not self._mesh_ok(their_mesh):
                 self.reject_mesh(their_mesh)
                 return
             content_len = int(self.headers.get("Content-Length", 0))
@@ -4166,6 +4999,15 @@ def main():
         print(f"[!] WARNING: {TRUSTED_KEYS_ENV} not set: ANY validly signed peer event is accepted.")
     else:
         print(f"[✓] Trusted-keys allowlist: {len(STATE.trusted_keys)} key(s); others get 403")
+    qs = quiet_status()
+    if STATE.quiet_mode == "off":
+        print(f"[✓] Quiet mesh: off ({qm.MODE_ENV}=off): open beacons, :5005 answers as before, no pairing")
+    elif qs["active"]:
+        print(f"[✓] Quiet mesh: ON ({qs['paired']} paired device(s)). Beacons carry only a rotating token; "
+              f":5005 closes silently for anyone who isn't paired or allowlisted")
+    else:
+        print(f"[✓] Quiet mesh: {STATE.quiet_mode}, no paired devices yet: open beacons as before. "
+              f"Pair a device (POST /api/pair/offer) to go quiet")
     if HUB_REMOTE:
         hosts = hub_listen_hosts()
         addrs = [HUB_BIND] if HUB_BIND != "0.0.0.0" else [a for a in (tailscale_ip(), LOCAL_IP) if a and a != "127.0.0.1"]
@@ -4192,7 +5034,7 @@ def main():
     for host in hub_listen_hosts():
         servers.append(bind_server(host, TELEMETRY_PORT, TelemetryHandler))
         servers.append(bind_server(host, CONTINUITY_IPC_PORT, ContinuityIPCHandler))
-    servers.append(bind_server(P2P_HOST, P2P_SYNC_PORT, P2PSyncHandler))
+    servers.append(bind_server(P2P_HOST, P2P_SYNC_PORT, P2PSyncHandler, cls=P2PServer))
     _p2p6 = bind_p2p_ipv6(P2P_SYNC_PORT, P2PSyncHandler)
     if _p2p6 is not None:
         servers.append(_p2p6)

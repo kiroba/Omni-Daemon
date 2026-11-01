@@ -6,14 +6,16 @@
 Same sections, words and colours as the Android app (kiroba/Omni-Node-Daemon), from omni_node_words.py:
   Network switch + status card (dot + one plain line), Connect apps (node token, shown after you confirm),
   Internet (your address and whether others can reach you), Relay calls (on by default on desktops, daily
-  limit), Peers (add a friend's address, your phone, or a server).
+  limit), Peers (add a friend's address, your phone, or a server), Pair a device (daemon v8.24.0: show a
+  6-digit code + QR, enter a code, paired devices with Remove, and the Quiet mode line).
 
 It starts the daemon (omni_live_daemon_server.py) as a child with OMNI_LOCAL_TOKEN=1, exactly like the
 Android app, so other apps need the token to use :5000/:9100. If a daemon is already running it attaches
 to it instead (then the Network switch can't stop it; the card says so).
 
 Only the standard library is required (tkinter). Optional: `pip install pystray pillow` for a tray icon
-with a status colour and Open / Pause / Quit (issue #80). Settings: ~/.omni/node_desktop.json.
+with a status colour and Open / Pause / Quit (issue #80); `pip install qrcode` (pure Python) to also draw
+the pairing QR code (without it the code and the pairing text are shown). Settings: ~/.omni/node_desktop.json.
 """
 import json
 import os
@@ -99,6 +101,45 @@ def parse_peer(text: str):
     return host, port
 
 
+def parse_pair_input(text: str):
+    """What the person typed in Enter a code -> the /api/pair/accept body, or None.
+    '123 456' -> code; 'omni://pair?p=...' -> payload; '123456 192.168.1.20[:5005]' -> code + address."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.startswith("omni://pair") or (len(t) > 40 and " " not in t):
+        return {"payload": t}
+    parts = t.split()
+    addr = None
+    if len(parts) > 1 and not parts[-1].replace("-", "").isdigit():
+        addr = parse_peer(parts[-1])
+        if addr is None:
+            return None
+        parts = parts[:-1]
+    digits = "".join(ch for ch in "".join(parts) if ch.isdigit())
+    if len(digits) != 6 or any(not (ch.isdigit() or ch in " -") for ch in " ".join(parts)):
+        return None
+    body = {"code": digits}
+    if addr:
+        body.update(host=addr[0], port=addr[1])
+    return body
+
+
+def qr_matrix(text: str):
+    """QR modules as a list of bool rows when the pure-Python `qrcode` package is installed, else None."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    try:
+        qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+        qr.add_data(text)
+        qr.make(fit=True)
+        return qr.get_matrix()
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------- talking to the node
 
 class NodeClient:
@@ -155,6 +196,28 @@ class NodeClient:
 
     def add_peer(self, host: str, port: int):
         return self._call(f"{self.ipc}/api/sync/peers", {"host": host, "port": port, "transport": "manual"})
+
+    # ---- pairing (daemon v8.24.0, loopback + local token)
+    def pair_list(self):
+        return self._call(f"{self.ipc}/api/pair/list")
+
+    def pair_offer(self):
+        return self._call(f"{self.ipc}/api/pair/offer", {})
+
+    def pair_offer_status(self):
+        return self._call(f"{self.ipc}/api/pair/offer")
+
+    def pair_cancel(self):
+        return self._call(f"{self.ipc}/api/pair/cancel", {})
+
+    def pair_accept(self, text: str):
+        body = parse_pair_input(text)
+        if body is None:
+            return 400, {"message": "Type the 6-digit code, or paste the pairing text."}
+        return self._call(f"{self.ipc}/api/pair/accept", body, timeout=45.0)
+
+    def pair_remove(self, pubkey: str):
+        return self._call(f"{self.ipc}/api/pair/remove", {"pubkey": pubkey})
 
 
 # --------------------------------------------------------------------------- the daemon process
@@ -284,6 +347,10 @@ class NodeWindow:
         self.node_id = ""
         self.wan_addr = ""
         self._busy = False
+        self.pairing = None        # /api/pair/list answer
+        self.offer = None          # /api/pair/offer answer while a code shows
+        self._pair_busy = False
+        self._offer_drawn = None   # the payload the QR canvas was drawn for
 
         root.title(W.TITLE)
         root.configure(bg=W.BG)
@@ -348,6 +415,41 @@ class NodeWindow:
         self._button(outer, "Add peer", self.add_peer_dialog)
         self.peers_box = tk.Frame(outer, bg=W.BG)
         self.peers_box.pack(fill="x")
+
+        self._section(outer, W.PAIR_TITLE)
+        self._hint(outer, W.PAIR_HINT)
+        self.quiet = self._line(outer)
+        prow = self.tk.Frame(outer, bg=W.BG)
+        prow.pack(fill="x")
+        self.pair_show_btn = self._button(prow, W.PAIR_SHOW, self.pair_show)
+        self.pair_show_btn.pack_configure(side="left", padx=(0, 8))
+        self.pair_enter_btn = self._button(prow, W.PAIR_ENTER, self.pair_enter_dialog)
+        self.pair_enter_btn.pack_configure(side="left")
+        self.offer_box = tk.Frame(outer, bg=W.CARD, highlightbackground=W.CARD_EDGE, highlightthickness=1,
+                                  padx=14, pady=10)
+        self.offer_code = tk.Label(self.offer_box, text="", bg=W.CARD, fg=W.TEXT, font=("Consolas", 26, "bold"),
+                                   anchor="w")
+        self.offer_code.pack(fill="x")
+        self.offer_expiry = tk.Label(self.offer_box, text="", bg=W.CARD, fg=W.TEXT_2, font=self.small, anchor="w")
+        self.offer_expiry.pack(fill="x")
+        self.offer_howto = tk.Label(self.offer_box, text=W.PAIR_CODE_HOWTO, bg=W.CARD, fg=W.TEXT_2, font=self.small,
+                                    wraplength=380, justify="left", anchor="w")
+        self.offer_howto.pack(fill="x", pady=(4, 6))
+        self._wraps.append((self.offer_howto, 32))
+        self.offer_qr = tk.Canvas(self.offer_box, width=1, height=1, bg="#FFFFFF", highlightthickness=0)
+        self.offer_text = tk.Entry(self.offer_box, font=("Consolas", 8), relief="flat", bg=W.BG, fg=W.TEXT_2,
+                                   readonlybackground=W.BG)
+        self.offer_text.pack(fill="x", pady=(0, 2))
+        tk.Label(self.offer_box, text=W.PAIR_TEXT_WARNING, bg=W.CARD, fg=W.TEXT_3, font=self.small, anchor="w",
+                 wraplength=380, justify="left").pack(fill="x")
+        obtn = tk.Frame(self.offer_box, bg=W.CARD)
+        obtn.pack(fill="x", pady=(6, 0))
+        tk.Button(obtn, text=W.PAIR_COPY, command=self.pair_copy_text, relief="flat", bg="#2A2A2A", fg=W.TEXT,
+                  bd=0, padx=10, pady=4, cursor="hand2").pack(side="left")
+        tk.Button(obtn, text=W.PAIR_STOP, command=self.pair_stop, relief="flat", bg="#2A2A2A", fg=W.TEXT,
+                  bd=0, padx=10, pady=4, cursor="hand2").pack(side="left", padx=(8, 0))
+        self.paired_box = tk.Frame(outer, bg=W.BG)
+        self.paired_box.pack(fill="x", pady=(6, 0))
 
         self._section(outer, "Background")
         self.login_var = tk.BooleanVar(value=bool(self.settings["start_at_login"]))
@@ -553,6 +655,85 @@ class NodeWindow:
         else:
             self.settings.set(start_at_login=on)
 
+    # ---- Pair a device (network calls off the UI thread; results come back through root.after)
+    def _bg(self, fn, done):
+        def run():
+            try:
+                result = fn()
+            except (OSError, ValueError) as e:
+                result = (0, {"message": f"can't reach the node ({e})"})
+            try:
+                self.root.after(0, lambda: done(*result))
+            except RuntimeError:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+    def pair_show(self):
+        if not self.settings["network_on"]:
+            self.say("Turn on Network first.")
+            return
+
+        def done(code, body):
+            if code == 200 and body.get("active"):
+                self.offer = body
+            else:
+                self.say(body.get("message") or f"The node answered {code}")
+            self.render()
+        self._bg(self.client.pair_offer, done)
+
+    def pair_stop(self):
+        self.offer = None
+        self._bg(self.client.pair_cancel, lambda code, body: self.render())
+        self.render()
+
+    def pair_copy_text(self):
+        if self.offer:
+            self.copy(self.offer.get("payload", ""), "Pairing text copied.")
+
+    def pair_enter_dialog(self):
+        from tkinter import simpledialog
+        if not self.settings["network_on"]:
+            self.say("Turn on Network first.")
+            return
+        text = simpledialog.askstring(W.PAIR_ENTER, W.PAIR_ENTER_HOWTO, parent=self.root)
+        if text is None:
+            return
+        if parse_pair_input(text) is None:
+            self.say("Type the 6-digit code, or paste the pairing text.")
+            return
+        self._pair_busy = True
+        self.say(W.PAIR_LOOKING)
+
+        def done(code, body):
+            self._pair_busy = False
+            if code == 200:
+                self.say(W.PAIR_DONE)
+            elif code == 403:
+                self.say(W.PAIR_WRONG)
+            elif code == 410:
+                self.say(W.PAIR_LOCKED)
+            else:
+                self.say(body.get("message") or f"The node answered {code}")
+            self._bg(self.client.pair_list, self._got_pairing)
+        self._bg(lambda: self.client.pair_accept(text), done)
+
+    def pair_remove(self, peer: dict):
+        from tkinter import messagebox
+        if not messagebox.askyesno(W.PAIR_REMOVE, W.pair_remove_confirm(peer.get("name") or "this device"),
+                                   parent=self.root):
+            return
+
+        def done(code, body):
+            if code != 200:
+                self.say(body.get("message") or f"The node answered {code}")
+            self._bg(self.client.pair_list, self._got_pairing)
+        self._bg(lambda: self.client.pair_remove(peer["pubkey"]), done)
+
+    def _got_pairing(self, code, body):
+        if code == 200:
+            self.pairing = body
+        self.render()
+
     # ---- refresh (network calls off the UI thread)
     def tick(self):
         if not self._busy and self.settings["network_on"]:
@@ -585,6 +766,21 @@ class NodeWindow:
                         except OSError:
                             self.peer_state[key] = "not handed in yet"
                     self.last_peer_post = time.time()
+                try:
+                    code, body = self.client.pair_list()
+                    self.pairing = body if code == 200 else None
+                    if self.offer is not None:
+                        code, body = self.client.pair_offer_status()
+                        if code == 200 and body.get("active"):
+                            self.offer = body
+                        elif code == 200:
+                            ended = body.get("ended")
+                            self.offer = None
+                            msg = W.PAIR_DONE if ended == "paired" else (W.PAIR_LOCKED if ended == "locked"
+                                                                         else W.PAIR_ENDED)
+                            self.root.after(0, lambda m=msg: self.say(m))
+                except (OSError, ValueError):
+                    pass
             elif self.manage_daemon and not self.daemon.attached:
                 err = err or self.daemon.exit_problem()
             self.health, self.health_err = health, err
@@ -623,8 +819,63 @@ class NodeWindow:
                                 fg=W.GREEN if st == "ok" else W.AMBER, font=self.font, anchor="w", cursor="hand2")
             lab.pack(fill="x")
             lab.bind("<Button-1>", lambda _e, k=key: self.remove_peer(k))
+        self.render_pairing(on, h)
         if self.tray is not None:
             self.tray.update(line)
+
+    def render_pairing(self, on: bool, h):
+        quiet = (h or {}).get("quiet") or ((self.pairing or {}).get("quiet") if on else None)
+        text, color = W.quiet_line(quiet if on else None)
+        if not on:
+            text, color = "Quiet mode: off (turn on Network first)", W.TEXT_3
+        self.quiet.configure(text=text, fg=color)
+        offer = self.offer if on else None
+        if offer:
+            self.offer_code.configure(text=W.pair_code_display(offer.get("code", "")))
+            self.offer_expiry.configure(text=W.pair_expires(offer.get("expires_in", 0), offer.get("attempts_left", 0)))
+            payload = offer.get("payload", "")
+            if self._offer_drawn != payload:
+                self._offer_drawn = payload
+                self.offer_text.configure(state="normal")
+                self.offer_text.delete(0, "end")
+                self.offer_text.insert(0, payload)
+                self.offer_text.configure(state="readonly")
+                self._draw_qr(payload)
+            if not self.offer_box.winfo_manager():
+                self.offer_box.pack(fill="x", pady=(8, 0), before=self.paired_box)
+        else:
+            self._offer_drawn = None
+            self.offer_qr.pack_forget()
+            self.offer_box.pack_forget()
+        for child in self.paired_box.winfo_children():
+            child.destroy()
+        peers = (self.pairing or {}).get("peers") or []
+        if not peers:
+            self.tk.Label(self.paired_box, text=W.PAIR_NONE, bg=W.BG, fg=W.TEXT_3, font=self.font,
+                          anchor="w").pack(fill="x")
+        for p in peers:
+            row = self.tk.Frame(self.paired_box, bg=W.BG)
+            row.pack(fill="x", pady=1)
+            self.tk.Label(row, text=W.paired_line(p), bg=W.BG, fg=W.GREEN if p.get("online") else W.TEXT_2,
+                          font=self.font, anchor="w").pack(side="left", fill="x", expand=True)
+            self.tk.Button(row, text=W.PAIR_REMOVE, command=lambda q=p: self.pair_remove(q), relief="flat",
+                           bg="#2A2A2A", fg=W.TEXT, bd=0, padx=8, pady=2, cursor="hand2").pack(side="right")
+
+    def _draw_qr(self, payload: str):
+        m = qr_matrix(payload) if payload else None
+        c = self.offer_qr
+        c.delete("all")
+        if not m:
+            c.pack_forget()
+            return
+        cell = max(2, min(5, 220 // len(m)))
+        size = cell * len(m)
+        c.configure(width=size, height=size)
+        for y, row in enumerate(m):
+            for x, dark in enumerate(row):
+                if dark:
+                    c.create_rectangle(x * cell, y * cell, (x + 1) * cell, (y + 1) * cell, fill="#000000", width=0)
+        c.pack(anchor="w", pady=(0, 6), before=self.offer_text)
 
     def quit(self):
         if self.tray is not None:
