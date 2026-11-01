@@ -291,12 +291,14 @@ class NodeWindow:
         root.minsize(400, 560)
         f = ("Segoe UI", 10) if os.name == "nt" else ("Helvetica", 10)
         self.font, self.small = f, (f[0], 9)
-        outer = tk.Frame(root, bg=W.BG, padx=18, pady=14)
-        outer.pack(fill="both", expand=True)
+        self._wraps = []          # (label, inset): wraplength follows the window width
+        outer = self._scroll_area(root)
 
         tk.Label(outer, text=W.TITLE, bg=W.BG, fg=W.TEXT, font=(f[0], 20, "bold"), anchor="w").pack(fill="x")
-        tk.Label(outer, text=W.SUBTITLE, bg=W.BG, fg=W.TEXT_2, font=f, wraplength=410, justify="left",
-                 anchor="w").pack(fill="x", pady=(2, 10))
+        sub = tk.Label(outer, text=W.SUBTITLE, bg=W.BG, fg=W.TEXT_2, font=f, wraplength=410, justify="left",
+                       anchor="w")
+        sub.pack(fill="x", pady=(2, 10))
+        self._wraps.append((sub, 0))
 
         row = tk.Frame(outer, bg=W.BG)
         row.pack(fill="x")
@@ -316,6 +318,7 @@ class NodeWindow:
         self.detail = tk.Label(card, text="", bg=W.CARD, fg=W.TEXT_2, font=f, anchor="w", justify="left",
                                wraplength=400)
         self.detail.pack(fill="x", pady=(4, 0))
+        self._wraps.append((self.detail, 32))
         self.node = tk.Label(card, text="", bg=W.CARD, fg=W.TEXT_3, font=self.small, anchor="w", cursor="hand2")
         self.node.pack(fill="x")
         self.node.bind("<Button-1>", lambda _e: self.copy(self.node_id, "Node key copied"))
@@ -360,19 +363,70 @@ class NodeWindow:
         self.render()
         self.root.after(200, self.tick)
 
+    # ---- scrolling (the Peers section was cut off at the default size on Windows)
+    def _scroll_area(self, root):
+        """Canvas + Scrollbar around the content frame. Returns the frame the sections pack into."""
+        tk = self.tk
+        box = tk.Frame(root, bg=W.BG)
+        box.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(box, bg=W.BG, highlightthickness=0, bd=0)
+        self.scrollbar = tk.Scrollbar(box, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content = tk.Frame(self.canvas, bg=W.BG, padx=18, pady=14)
+        self._content_id = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._on_content_size)
+        self.canvas.bind("<Configure>", self._on_canvas_size)
+        # Wheel: Windows and macOS send <MouseWheel>; X11 sends Button-4/5.
+        root.bind_all("<MouseWheel>", self._on_wheel, add="+")
+        root.bind_all("<Button-4>", self._on_wheel, add="+")
+        root.bind_all("<Button-5>", self._on_wheel, add="+")
+        return self.content
+
+    def _on_content_size(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_size(self, e):
+        self.canvas.itemconfigure(self._content_id, width=e.width)   # content is as wide as the canvas
+        inner = e.width - 36                                            # content padx 18 on each side
+        for lab, inset in self._wraps:
+            lab.configure(wraplength=max(200, inner - inset))
+
+    def _on_wheel(self, e):
+        try:
+            if e.widget.winfo_toplevel() is not self.root:
+                return              # a dialog (Add peer, daily limit) is under the pointer
+        except (AttributeError, KeyError, self.tk.TclError):
+            return
+        if self.content.winfo_height() <= self.canvas.winfo_height():
+            return                  # everything fits: nothing to scroll
+        if getattr(e, "num", None) == 4:
+            step = -1
+        elif getattr(e, "num", None) == 5:
+            step = 1
+        elif sys.platform == "darwin":
+            step = -int(e.delta)
+        else:
+            step = -int(e.delta / 120) or (-1 if e.delta > 0 else 1)
+        self.canvas.yview_scroll(step, "units")
+
     # ---- small builders
     def _section(self, parent, title):
         self.tk.Label(parent, text=title, bg=W.BG, fg=W.TEXT, font=(self.font[0], 13, "bold"),
                       anchor="w").pack(fill="x", pady=(14, 2))
 
     def _hint(self, parent, text):
-        self.tk.Label(parent, text=text, bg=W.BG, fg=W.TEXT_3, font=self.small, wraplength=410,
-                      justify="left", anchor="w").pack(fill="x")
+        lab = self.tk.Label(parent, text=text, bg=W.BG, fg=W.TEXT_3, font=self.small, wraplength=410,
+                            justify="left", anchor="w")
+        lab.pack(fill="x")
+        self._wraps.append((lab, 0))
 
     def _line(self, parent):
         lab = self.tk.Label(parent, text="", bg=W.BG, fg=W.TEXT_2, font=self.font, wraplength=410,
                             justify="left", anchor="w")
         lab.pack(fill="x", pady=(2, 0))
+        self._wraps.append((lab, 0))
         return lab
 
     def _button(self, parent, text, cmd):
