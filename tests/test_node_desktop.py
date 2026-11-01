@@ -190,6 +190,9 @@ class AgainstARealDaemon(unittest.TestCase):
                 self.assertEqual(win.status.cget("text"), "Connected to 2 nearby")
                 self.assertEqual(win.dot.cget("fg"), W.GREEN)
                 self.assertTrue(win.wan.cget("text").startswith("Reachable at"))
+                root.update_idletasks()   # the sections sit in a scrollable canvas; Peers is inside it
+                self.assertIs(win.peers_box.master, win.content)
+                self.assertTrue(str(win.scrollbar.cget("command")).endswith("yview"))
                 win._poll()   # real round trip to the daemon, off the Tk thread in the app
                 root.update()
                 self.assertEqual(win.status.cget("text"), W.LOOKING)
