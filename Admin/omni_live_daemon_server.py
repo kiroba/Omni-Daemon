@@ -4445,6 +4445,11 @@ try:
     LPE_VIBES_PER_DAY = max(1, min(100, int(os.environ.get("OMNI_LPE_VIBES_PER_DAY", "3"))))
 except ValueError:
     LPE_VIBES_PER_DAY = 3
+# kiroba/Omni-Node-Daemon scripts/fetch_daemon.sh packages every module named on a line that starts
+# with "import omni_..."; the import below is lazy (indented), so this string names it for the APK:
+_LPE_PACKAGING_HINT = """
+import omni_lpe
+"""
 _LPE_MODULE = None
 _LPE_CACHE = {"key": None, "events": []}
 _LPE_CACHE_LOCK = threading.Lock()

@@ -67,6 +67,12 @@ class Unit(unittest.TestCase):
                 names.add((node.module or "").split(".")[0])
         self.assertTrue(names <= {"hashlib", "json", "math", "re", "threading", "urllib"}, names)
 
+    def test_android_packager_finds_the_module(self):
+        """Omni-Node-Daemon's fetch_daemon.sh copies modules found by grep -E '^(import|from) omni_...'."""
+        import re
+        text = (ADMIN / "omni_live_daemon_server.py").read_text(encoding="utf-8")
+        self.assertIn("omni_lpe", re.findall(r"^(?:import|from) (omni_[a-z0-9_]+)", text, re.M))
+
     def test_validators_strict(self):
         lpe.validate_profile({"schema": 1, "handle": "kiro_b", "avatar": "default_01",
                               "cosmetics": ["head_socket_crown"], "ambient_activity": "Training"})
