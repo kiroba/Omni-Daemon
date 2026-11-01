@@ -132,6 +132,62 @@ def relay_line(relay: dict | None, network_on: bool, want_on: bool, cap_mb: int)
     return "Starting the relay...", TEXT_2
 
 
+# ---- Pair a device / quiet mode (daemon v8.24.0; NodePairing.kt on Android) ----
+PAIR_TITLE = "Pair a device"
+PAIR_HINT = ("Pair your phone, your PC or a friend's device. Paired nodes find each other quietly: "
+             "other people on the same Wi-Fi can't see who you are.")
+PAIR_SHOW = "Show a code"
+PAIR_ENTER = "Enter a code"
+PAIR_STOP = "Stop showing the code"
+PAIR_CODE_HOWTO = ("On the other device open Omni Node, choose Pair a device, then Enter a code and type this "
+                   "code. Keep both on the same Wi-Fi.")
+PAIR_ENTER_HOWTO = ("Type the 6-digit code the other device shows, or paste its pairing text. If it can't be "
+                    "found, add its address after the code, like 123456 192.168.1.20")
+PAIR_LOOKING = "Looking for the other device..."
+PAIR_DONE = "Paired. Your nodes now find each other quietly."
+PAIR_WRONG = "That code didn't match."
+PAIR_LOCKED = "Too many wrong codes. Make a new code on the other device."
+PAIR_NONE = "No paired devices yet."
+PAIR_COPY = "Copy pairing text"
+PAIR_TEXT_WARNING = "Anyone with this text can pair with you while the code shows. Only send it to yourself."
+PAIR_REMOVE = "Remove"
+PAIR_ENDED = "The code stopped working. Show a new one."
+
+
+def pair_expires(seconds: int, tries_left: int) -> str:
+    s = max(0, int(seconds))
+    return f"Expires in {s // 60}:{s % 60:02d} · {tries_left} {'try' if tries_left == 1 else 'tries'} left"
+
+
+def pair_code_display(code: str) -> str:
+    """'123456' -> '123 456' (easier to read out)."""
+    return f"{code[:3]} {code[3:]}" if len(code or "") == 6 else (code or "")
+
+
+def pair_remove_confirm(name: str) -> str:
+    return f"Remove {name}? Your nodes stop syncing with each other. To connect again, pair again."
+
+
+def paired_line(peer: dict) -> str:
+    tag = peer.get("tag") or ""
+    where = "nearby now" if peer.get("online") else "not nearby"
+    return f"{peer.get('name') or 'Omni node'} {tag}  ·  {where}"
+
+
+def quiet_line(quiet: dict | None) -> tuple[str, str]:
+    """(text, colour) for the Quiet mode status line, from node-health "quiet"."""
+    if not quiet:
+        return "Quiet mode: checking...", TEXT_3
+    if quiet.get("mode") == "off":
+        return "Quiet mode: off on this node", TEXT_3
+    n = int(quiet.get("paired") or 0)
+    if quiet.get("active") and n > 0:
+        return f"Quiet mode: on · only your {n} paired device{'' if n == 1 else 's'} can see this node", GREEN
+    if quiet.get("active"):
+        return "Quiet mode: on · no devices paired yet", AMBER
+    return "Quiet mode: off until you pair a device", TEXT_3
+
+
 def tray_tooltip(line: str) -> str:
     """Windows caps tray tooltips at 127 characters."""
     return f"Omni Node · {line}"[:127]

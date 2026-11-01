@@ -5,6 +5,7 @@ The same screen as Omni Node on Android, for the computer that runs your daemon.
 ```
 python Admin/omni_node_desktop.py            # or double-click Admin/omni_node_desktop.pyw on Windows
 pip install pystray pillow                   # optional: tray icon (status colour, Open / Pause / Quit)
+pip install qrcode                           # optional: draw the pairing QR code (pure Python)
 ```
 
 | Section | Same as Android | Desktop difference |
@@ -14,6 +15,7 @@ pip install pystray pillow                   # optional: tray icon (status colou
 | Internet | Your address and whether others can reach you (node-health `wan`) | |
 | Relay calls | Same switch and status line | On by default, no limit unless you pick one (1, 5 or 20 GB a day) |
 | Peers | Add a friend's address, your phone or a server; re-handed to the daemon every 60 s | |
+| Pair a device (daemon v8.24.0) | Show a code (6 digits, 5 minutes, 5 tries), Enter a code, the paired devices with Remove, and the Quiet mode line | Also shows the pairing text to paste, and draws the QR when the pure-Python `qrcode` package is installed (`pip install qrcode`); Enter a code accepts `123456 192.168.1.20` when the other device can't be found. See `QUIET_MESH.md` |
 | Background | | "Start when I sign in": per-user Run key on Windows, LaunchAgent on macOS, autostart file on Linux. No admin needed |
 
 The app starts the daemon with `OMNI_LOCAL_TOKEN=1` and `PYTHONUTF8=1`, exactly like the Android app, and logs it to `~/.omni/node_desktop_daemon.log`. Settings live in `~/.omni/node_desktop.json`.
