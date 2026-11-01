@@ -91,6 +91,8 @@ from omni_signing import (load_or_create_key, pubkey_hex, sign_event, verify_eve
                           TRUSTED_KEYS_ENV)
 import omni_negentropy as neg
 import omni_wan
+import omni_relay
+import ipaddress
 import threading
 import socket
 import urllib.request
@@ -99,7 +101,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.21.0"
+VERSION = "8.22.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -2420,16 +2422,221 @@ def build_ice_config(pubkey: str, env=None) -> dict:
     return resp
 
 
-def signal_ice_config(query: str) -> tuple:
+def signal_ice_config(query: str, reached_host: str = "") -> tuple:
     try:
         _params, pubkey, _ts, sig = verify_signal_auth(query, SIGNAL_ICE_TYPE, "pubkey", _SIGNAL_ICE_ARGS)
         with SIGNAL_MAILBOX.cond:
             SIGNAL_MAILBOX._remember_sig_locked(sig)
         TELEMETRY.inc("signal_ice_config_ok")
-        return build_ice_config(pubkey), 200
+        return add_self_hosted_relays(build_ice_config(pubkey), pubkey, query, reached_host), 200
     except SignalError as e:
         TELEMETRY.inc("signal_ice_config_rejected")
         return {"status": "ERROR", "message": e.message}, e.status
+
+
+# --- Built-in STUN/TURN relay (v8.22.0) -----------------------------------------------------------
+# Every node can relay OmniCast media for the mesh: desktops by default, phones only when the Omni Node
+# app turns it on (Wi-Fi + charging + cap). ice-config hands out this node's relay plus up to
+# RELAY_PEER_MAX peers' relays, each with its own short-lived TURN REST credential. Public STUN is only
+# used when no self-hosted STUN is known.
+
+RELAY_ENV = "OMNI_RELAY"                 # on | off | auto (default auto: on for desktop, off on Android)
+RELAY_PUBLIC_IP_ENV = "OMNI_RELAY_PUBLIC_IP"
+RELAY_PEER_MAX = 4
+RELAY_PEER_TIMEOUT_S = 3.0
+RELAY = None
+
+
+def relay_mode_default(env=None) -> bool:
+    env = os.environ if env is None else env
+    mode = (env.get(RELAY_ENV, "auto") or "auto").strip().lower()
+    if mode in ("1", "on", "true", "yes"):
+        return True
+    if mode in ("0", "off", "false", "no"):
+        return False
+    return not omni_relay.is_android()
+
+
+def relay_public_ip():
+    manual = os.environ.get(RELAY_PUBLIC_IP_ENV, "").strip()
+    if manual:
+        return manual
+    snap = WAN.snapshot() if WAN else {}
+    addr = str(snap.get("public_addr") or "")
+    if addr and not addr.startswith("["):
+        host = addr.rsplit(":", 1)[0]
+        try:
+            if ipaddress.ip_address(host).version == 4:
+                return host
+        except ValueError:
+            pass
+    return None
+
+
+def relay_get():
+    global RELAY
+    if RELAY is None:
+        secret = omni_relay.load_or_create_secret(str(Path.home() / ".omni" / "relay_secret"))
+        RELAY = omni_relay.Relay(secret, public_ip_fn=relay_public_ip, local_ip_fn=lambda: LOCAL_IP,
+                                 log=lambda m: print(m, flush=True))
+    return RELAY
+
+
+def relay_running() -> bool:
+    return RELAY is not None and RELAY.running
+
+
+def relay_set_enabled(on: bool) -> dict:
+    r = relay_get()
+    if on and not r.running:
+        if r.start():
+            print(f"[✓] Relay on: STUN + TURN on UDP {r.port}, relayed ports {r.port_range[0]}-{r.port_range[1]}", flush=True)
+            threading.Thread(target=relay_upnp_map, name="omni-relay-upnp", daemon=True).start()
+        else:
+            print(f"[!] Relay could not start: {r.error}", flush=True)
+    elif not on and r.running:
+        r.stop()
+        print("[✓] Relay off", flush=True)
+    return relay_status()
+
+
+def relay_upnp_map():
+    """Ask the router to forward UDP <relay port> + the relayed range. Best effort, refreshed hourly."""
+    if os.environ.get("OMNI_UPNP", "1").strip() == "0":
+        return
+    while relay_running():
+        r = RELAY
+        ports = [r.port] + list(range(r.port_range[0], r.port_range[1] + 1))
+        ok = 0
+        for p in ports:
+            try:
+                omni_wan.upnp_map(LOCAL_IP, p, "Omni relay", protocol="UDP", tries=1)
+                ok += 1
+            except Exception:
+                if ok == 0:
+                    break          # no router / UPnP off: don't hammer it 40 more times
+        r.upnp = f"mapped {ok}/{len(ports)} UDP ports" if ok else "not mapped (forward the UDP ports by hand)"
+        for _ in range(3600):
+            if not relay_running():
+                return
+            time.sleep(1)
+
+
+def relay_status() -> dict:
+    r = relay_get()
+    snap = r.snapshot()
+    pub = relay_public_ip()
+    snap["public"] = f"{pub}:{r.port}" if (pub and r.running) else None
+    snap["upnp"] = getattr(r, "upnp", "")
+    return snap
+
+
+def relay_config(data) -> tuple:
+    """Loopback POST /api/relay/config {enabled?, max_kbps?, max_mb_day?, allow_private?}."""
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    try:
+        kb = data.get("max_kbps")
+        mb = data.get("max_mb_day")
+        if kb is not None and (isinstance(kb, bool) or not isinstance(kb, int) or not 64 <= kb <= 1_000_000):
+            raise ValueError("max_kbps must be an integer 64..1000000")
+        if mb is not None and (isinstance(mb, bool) or not isinstance(mb, int) or not 0 <= mb <= 10_000_000):
+            raise ValueError("max_mb_day must be an integer 0..10000000 (0 = unlimited)")
+        ap = data.get("allow_private")
+        if ap is not None and not isinstance(ap, bool):
+            raise ValueError("allow_private must be true or false")
+        en = data.get("enabled")
+        if en is not None and not isinstance(en, bool):
+            raise ValueError("enabled must be true or false")
+    except ValueError as e:
+        return {"status": "ERROR", "message": str(e)}, 400
+    relay_get().set_config(max_kbps=kb, max_mb_day=mb, allow_private=ap)
+    if en is not None:
+        relay_set_enabled(en)
+    return dict(relay_status(), status="OK"), 200
+
+
+def relay_cred_for(pubkey: str) -> dict:
+    """Our relay's credential for an app key (used for ourselves and for peers asking on its behalf)."""
+    r = RELAY
+    username, credential = r.credential(pubkey, 3600)
+    return {"port": r.port, "username": username, "credential": credential, "ttl": 3600,
+            "public": relay_status()["public"]}
+
+
+def answer_relay_cred(data) -> tuple:
+    """Peer endpoint POST /p2p/relay/cred {"query": <the app's signed ice-config query>}."""
+    q = data.get("query") if isinstance(data, dict) else None
+    if not isinstance(q, str):
+        return {"status": "ERROR", "message": "'query' must be the signed ice-config query string"}, 400
+    try:
+        _p, pubkey, _ts, _sig = verify_signal_auth(q, SIGNAL_ICE_TYPE, "pubkey", _SIGNAL_ICE_ARGS)
+    except SignalError as e:
+        return {"status": "ERROR", "message": e.message}, e.status
+    if not relay_running():
+        return {"status": "ERROR", "message": "relay is off on this node"}, 404
+    TELEMETRY.inc("relay_cred_for_peer")
+    return dict(relay_cred_for(pubkey), status="OK"), 200
+
+
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def peer_relay_servers(query: str) -> list:
+    """Ask up to RELAY_PEER_MAX peers for a TURN credential for this app key, in parallel."""
+    out, lock = [], threading.Lock()
+    def one(host, port):
+        try:
+            say_hello(host, port)
+            code, resp, _ = _peer_post(host, port, "/p2p/relay/cred", {"query": query}, timeout=RELAY_PEER_TIMEOUT_S)
+            if code != 200 or not isinstance(resp.get("port"), int):
+                return
+            h = _url_host(host)
+            entry = [{"urls": [f"stun:{h}:{resp['port']}"]},
+                     {"urls": [f"turn:{h}:{resp['port']}?transport=udp"],
+                      "username": str(resp["username"]), "credential": str(resp["credential"])}]
+            with lock:
+                out.append(entry)
+            TELEMETRY.inc("relay_peer_cred_ok")
+        except Exception:
+            TELEMETRY.inc("relay_peer_cred_failed")
+    threads = [threading.Thread(target=one, args=hp, daemon=True) for hp in catchup_peers()[:RELAY_PEER_MAX]]
+    for t in threads:
+        t.start()
+    deadline = time.time() + RELAY_PEER_TIMEOUT_S * 2 + 0.5
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    with lock:
+        return list(out)
+
+
+def add_self_hosted_relays(cfg: dict, pubkey: str, query: str, reached_host: str) -> dict:
+    """Prepend this node's STUN/TURN and peers' relays to a build_ice_config() answer."""
+    if cfg.get("status") != "OK":
+        return cfg
+    own, peers = [], []
+    if relay_running():
+        host = reached_host if reached_host and not _is_loopback(reached_host) else LOCAL_IP
+        c = relay_cred_for(pubkey)
+        h = _url_host(host)
+        own = [{"urls": [f"stun:{h}:{c['port']}"]},
+               {"urls": [f"turn:{h}:{c['port']}?transport=udp"], "username": c["username"], "credential": c["credential"]}]
+    try:
+        peers = [s for entry in peer_relay_servers(query) for s in entry]
+    except Exception:
+        peers = []
+    extra = own + peers
+    if not extra:
+        cfg["relays"] = 0
+        return cfg
+    servers = cfg["ice_servers"]
+    if not os.environ.get(STUN_URLS_ENV, "").strip() and servers and servers[0].get("urls") == list(DEFAULT_STUN_URLS):
+        servers = servers[1:]          # self-hosted STUN known: no public STUN dependency
+    cfg["ice_servers"] = extra + servers
+    cfg["relays"] = sum(1 for s in extra if "username" in s)
+    cfg["turn"] = True
+    return cfg
 
 
 # --- Catch-up sync (v8.8.0): negentropy range-based set reconciliation ---------------------------
@@ -3344,6 +3551,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "catchup": STATE.last_catchup,
                 "wan": WAN.snapshot() if WAN else None,
+                "relay": relay_status() if RELAY is not None else {"enabled": False},
                 "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
             }
@@ -3517,8 +3725,15 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
             self._send_json(status, resp)
             return
         if path == "/api/signal/ice-config":
-            resp, status = signal_ice_config(query)
+            try:
+                reached = self.connection.getsockname()[0]
+            except Exception:
+                reached = ""
+            resp, status = signal_ice_config(query, reached)
             self._send_json(status, resp)
+            return
+        if path == "/api/relay/status" and _is_loopback(self.client_address[0]):
+            self._send_json(200, dict(relay_status(), status="OK"))
             return
         if path in USER_GET_ROUTES:
             try:
@@ -3608,6 +3823,16 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
             data, ok = self._read_small_json(4096)
             if ok:
                 resp, status = add_radio_peer(data)
+                self._send_json(status, resp)
+            return
+        if self.path == "/api/relay/config":
+            # Loopback-only (never in REMOTE_POST_PATHS): Omni Node turns the phone relay on/off and caps it.
+            if not _is_loopback(self.client_address[0]):
+                _deny(self, 403, "loopback only")
+                return
+            data, ok = self._read_small_json(4096)
+            if ok:
+                resp, status = relay_config(data)
                 self._send_json(status, resp)
             return
         if self.path == "/api/sync/catchup":
@@ -3766,6 +3991,8 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
             resp, code = answer_dialback(data, ip)
         elif self.path == "/p2p/signal/send":
             resp, code = signal_send(data, forward=False)      # one hop: never re-forwarded
+        elif self.path == "/p2p/relay/cred":
+            resp, code = answer_relay_cred(data)
         else:
             q = data.get("query") if isinstance(data, dict) else None
             resp, code = signal_poll(q, pull=False) if isinstance(q, str) else (
@@ -3804,7 +4031,7 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
             TELEMETRY.inc("catchup_served_reconcile" if self.path == "/p2p/reconcile" else "catchup_served_events")
             self._json_reply(status_code, resp_data)
             return
-        if self.path in ("/p2p/hello", "/p2p/dialback", "/p2p/signal/send", "/p2p/signal/poll"):
+        if self.path in ("/p2p/hello", "/p2p/dialback", "/p2p/signal/send", "/p2p/signal/poll", "/p2p/relay/cred"):
             self._p2p_v821()
             return
         if self.path == "/p2p/sync":
@@ -3908,6 +4135,10 @@ def main():
     threading.Thread(target=WAN.run_forever, name="omni-wan", daemon=True).start()
     print(f"[✓] Internet check (v8.21.0): STUN + UPnP {'on' if WAN.upnp_on else 'off (OMNI_UPNP=0)'} + dial-back; "
           f"see node-health 'wan'", flush=True)
+    if relay_mode_default():
+        relay_set_enabled(True)
+    else:
+        print(f"[✓] Relay (v8.22.0): off ({RELAY_ENV}=on, or Omni Node > Relay calls, to turn it on)", flush=True)
 
     try:
         while True:
