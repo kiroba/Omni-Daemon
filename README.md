@@ -1,8 +1,25 @@
 # Omni-Daemon
 
-The networked protocol layer of The Omniverse. One daemon runs on each device. It keeps the signed event log, syncs with peers (negentropy catch-up), offers remote access over Tailscale, runs the test-credits ledger, and handles OmniCast signaling. Apps only ever talk to their own device's daemon.
+The networked protocol layer of The Omniverse. One daemon runs on each device. It keeps the signed event log, syncs with peers (negentropy catch-up), reaches other nodes over the Internet, relays calls, offers remote access over Tailscale, runs the test-credits ledger, and handles OmniCast signaling. Apps only ever talk to their own device's daemon.
 
 - Daemon and engines: `Admin/` (docs in `Admin/docs/`)
 - Tests: `python3 -m unittest tests.<name>`, run from the repo root
+
+## What a node does
+
+| Area | What it does | Docs |
+| --- | --- | --- |
+| Event log | Ed25519-signed, hash-chained events in SQLite (WAL); loopback API on `127.0.0.1:5000` | `Admin/docs/` |
+| Local token | Loopback endpoints require the node's token (`OMNI_LOCAL_TOKEN=1`; Bearer or `X-Omni-Local-Token`) | |
+| Peer sync | LAN discovery (UDP `:9101`) and negentropy catch-up over `:5005` | `CATCHUP_SYNC.md` |
+| Internet reach (v8.21) | Nodes behind a router join by dialing any reachable peer (signed `/p2p/hello`); UPnP, STUN and dial-back reachability show in node-health `wan` | `WAN.md` |
+| Call relay (v8.22, in review) | Built-in STUN + TURN (UDP 3478, relay ports 49160-49200). Desktops relay by default; phones only when Omni Node turns it on. Apps get this node's relay plus up to four peers' relays. No third-party STUN/TURN when an Omni relay is known | `RELAY.md` |
+| OmniCast signaling | Memory-only, signed mailbox `/api/signal/{send,poll,ice-config}` | `OMNICAST_SIGNALING.md` |
+| Remote hub | Opt-in, bearer token, for use over Tailscale | `REMOTE_HUB.md` |
+
+## No third-party servers
+Calls connect directly when they can (LAN, IPv6, hole punching) and otherwise relay through another Omni node. Nothing depends on hosted TURN/STUN. The relay has caps (allocations, kbps, MB per day) and refuses to relay to loopback, link-local or multicast addresses; LAN and carrier-NAT targets need `OMNI_RELAY_ALLOW_PRIVATE=1`.
+
+**Not yet:** TURN over TCP/TLS (for networks that block UDP), and field tests on real phones and carrier networks.
 
 Split out of [kiroba/The-Omniverse](https://github.com/kiroba/The-Omniverse) (`desktop` branch) with full history, minus tracked `*.db` files. Formerly named The-Omni-Hub.

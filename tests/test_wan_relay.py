@@ -73,7 +73,7 @@ class TwoNodes(unittest.TestCase):
     def test_1_versions(self):
         from daemon_version import DAEMON_VERSION
         self.assertEqual(self.hub.version, DAEMON_VERSION)
-        self.assertEqual(DAEMON_VERSION, "8.21.0")
+        self.assertGreaterEqual(tuple(map(int, DAEMON_VERSION.split("."))), (8, 21, 0))
 
     def test_2_unknown_caller_needs_hello(self):
         p2p = self.hub.ports["OMNI_P2P_PORT"]

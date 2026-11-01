@@ -155,8 +155,9 @@ def soap(control_url: str, service: str, action: str, args: dict, timeout: float
         raise RuntimeError(f"router refused {action} (UPnP error {code.group(1) if code else e.code})")
 
 
-def upnp_map(local_ip: str, port: int, description: str = "Omni node"):
-    """{"external_ip", "external_port", "service"} after mapping TCP port -> local_ip:port, or raises."""
+def upnp_map(local_ip: str, port: int, description: str = "Omni node", protocol: str = "TCP", tries: int = 6):
+    """{"external_ip", "external_port", "service"} after mapping `protocol` port -> local_ip:port, or raises.
+    tries=1 asks for the same external port only (relay ports must match what TURN advertises)."""
     loc = ssdp_find_igd()
     if not loc:
         raise LookupError("no router answered (UPnP off, or not on a home network)")
@@ -165,10 +166,10 @@ def upnp_map(local_ip: str, port: int, description: str = "Omni node"):
         raise LookupError("the router has no WAN connection service")
     ctrl, st = found
     last = None
-    for ext in [port] + list(range(port + 1, port + 6)):
+    for ext in [port] + list(range(port + 1, port + max(1, tries))):
         try:
             soap(ctrl, st, "AddPortMapping", {
-                "NewRemoteHost": "", "NewExternalPort": ext, "NewProtocol": "TCP",
+                "NewRemoteHost": "", "NewExternalPort": ext, "NewProtocol": protocol,
                 "NewInternalPort": port, "NewInternalClient": local_ip, "NewEnabled": 1,
                 "NewPortMappingDescription": description, "NewLeaseDuration": LEASE_S})
             ext_ip = None

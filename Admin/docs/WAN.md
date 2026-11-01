@@ -27,3 +27,8 @@
   are never written to disk.
 - UPnP exposes :5005 to the internet. Use a private `OMNI_MESH_ID` plus `OMNI_TRUSTED_KEYS_FILE`
   for anything beyond testing.
+
+
+## v8.22.0: self-hosted relay
+Media for calls between two carrier-NAT phones can now go through any reachable node's built-in TURN.
+See [RELAY.md](RELAY.md).

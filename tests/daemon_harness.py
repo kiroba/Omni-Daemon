@@ -124,6 +124,7 @@ class Daemon:
             self.env.pop(k, None)
         if remote:
             self.env.update(OMNI_HUB_REMOTE="1", OMNI_HUB_BIND="0.0.0.0")
+        self.env["OMNI_RELAY"] = "off"          # v8.22.0 relay is on by default on desktop; tests opt in
         self.env.update(env or {})
         self.ipc_port = self.ports["OMNI_IPC_PORT"]
         self.ipc = f"http://127.0.0.1:{self.ipc_port}"
