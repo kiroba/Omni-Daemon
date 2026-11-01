@@ -4505,6 +4505,12 @@ class _LpeCtx:
     def seeds():
         """Pre-trusted keys: paired keys (if this daemon has them) plus the trusted-keys allowlist."""
         seeds = set(getattr(STATE, "paired_keys", None) or ())
+        paired = getattr(STATE, "paired", None)          # v8.24.0 quiet mesh PairedStore, when merged
+        if paired is not None and callable(getattr(paired, "keys", None)):
+            try:
+                seeds |= set(paired.keys())
+            except Exception:
+                pass
         seeds |= set(STATE.trusted_keys or ())
         return seeds or None
 
