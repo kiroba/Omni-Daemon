@@ -90,6 +90,7 @@ from omni_signing import (load_or_create_key, pubkey_hex, sign_event, verify_eve
                           canonical_event_bytes, now_ms, load_trusted_keys, is_trusted,
                           TRUSTED_KEYS_ENV)
 import omni_negentropy as neg
+import omni_wan
 import threading
 import socket
 import urllib.request
@@ -98,7 +99,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.20.0"
+VERSION = "8.21.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -499,6 +500,10 @@ class EngineState:
         # v8.18.0: peers an app on this device found over a radio (BLE / Wi-Fi Aware / LAN scan) and
         # handed in on loopback POST /api/sync/peers. {(host, port): {"transport", "node_hash", "last_seen"}}
         self.radio_peers = {}
+        # v8.21.0: nodes behind NAT that dialed us and proved mesh membership with a signed hello.
+        # We can't dial them back, but they may pull (catch-up) and forward signals. {ip: {...}}
+        self.inbound_peers = {}
+        self.dialback_last = {}               # ip -> last dial-back time (rate limit)
         self.catchup_wake = threading.Event()  # set when a new peer shows up
         self.last_catchup = None               # summary of the last run, shown in node-health
         self.udp_listener = "starting"         # "listening" / "bind failed: ..." (telemetry summary)
@@ -2328,11 +2333,13 @@ def verify_signal_auth(query: str, kind_type: str, key_field: str, allowed: set,
     return params, pubkey, ts, sig
 
 
-def signal_send(data) -> tuple:
+def signal_send(data, forward: bool = True) -> tuple:
     try:
         msg = validate_signal_message(data)
         resp = SIGNAL_MAILBOX.send(msg)
         TELEMETRY.inc("signal_sends_ok")
+        if forward:
+            forward_signal(msg)
         return resp, 200
     except SignalError as e:
         TELEMETRY.inc("signal_sends_rejected")
@@ -2340,7 +2347,7 @@ def signal_send(data) -> tuple:
         return {"status": "ERROR", "message": e.message}, e.status
 
 
-def signal_poll(query: str) -> tuple:
+def signal_poll(query: str, pull: bool = True) -> tuple:
     try:
         params, to, _ts, sig = verify_signal_auth(query, SIGNAL_POLL_TYPE, "to", _SIGNAL_POLL_ARGS)
         since = _int_param(params, "since", required=False) or 0
@@ -2348,6 +2355,8 @@ def signal_poll(query: str) -> tuple:
         epoch = _one(params, "epoch", required=False)
         if epoch is not None and not _SIGNAL_EPOCH_RE.fullmatch(epoch):
             raise SignalError(400, "'epoch' must be the 16-hex epoch from an earlier poll/send answer")
+        if pull and wait:
+            pull_signals(query)          # peers' mailboxes, for callers on other nodes (v8.21.0)
         resp = SIGNAL_MAILBOX.poll(to, sig, since=since, wait=float(wait), epoch=epoch)
         if resp.get("cursor_reset"):
             TELEMETRY.inc("signal_cursor_resets")
@@ -2521,11 +2530,122 @@ def catchup_peer_allowed(ip: str) -> bool:
     for host, _ in STATE.sync_peers:
         if ip == host or ip in _resolve(host):
             return True
+    if inbound_peer_fresh(ip):
+        return True
     bare = ip.split("%", 1)[0]
     for host, _, _ in radio_peers_fresh():
         if ip == host or bare == host.split("%", 1)[0]:
             return True
     return False
+
+# ---- v8.21.0: internet without Tailscale ----
+HELLO_TYPE = "omni.p2p.hello.v1"
+INBOUND_PEER_TTL = 600.0
+HELLO_WINDOW_MS = 5 * 60 * 1000
+DIALBACK_MIN_GAP_S = 30.0
+
+def hello_bytes(node_id: str, mesh: str, ts: int) -> bytes:
+    return json.dumps({"type": HELLO_TYPE, "node_id": node_id, "mesh": mesh, "ts": ts},
+                      sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def make_hello() -> dict:
+    ts = now_ms()
+    sig = STATE.signing_key.sign(hello_bytes(STATE.node_id, STATE.mesh_id, ts)).hex()
+    return {"node_id": STATE.node_id, "ts": ts, "sig": sig}
+
+def accept_hello(data, ip: str) -> tuple:
+    """Server side of POST /p2p/hello: remember a NAT'd node that dialed in (signed, same mesh, trusted)."""
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    node_id, ts, sig = str(data.get("node_id", "")), data.get("ts"), str(data.get("sig", ""))
+    if not isinstance(ts, int) or isinstance(ts, bool) or abs(now_ms() - ts) > HELLO_WINDOW_MS:
+        return {"status": "ERROR", "message": "'ts' missing or outside the 5 minute window"}, 400
+    if not _ed25519_ok(node_id, sig, hello_bytes(node_id, STATE.mesh_id, ts)):
+        return {"status": "ERROR", "message": "bad hello signature"}, 401
+    if not is_trusted(node_id, STATE.trusted_keys):
+        return {"status": "ERROR", "message": "node key not on this mesh's allowlist"}, 403
+    with STATE.lock:
+        if len(STATE.inbound_peers) > 512:
+            cutoff = time.time() - INBOUND_PEER_TTL
+            STATE.inbound_peers = {k: v for k, v in STATE.inbound_peers.items() if v["last_seen"] > cutoff}
+        is_new = ip not in STATE.inbound_peers
+        STATE.inbound_peers[ip] = {"node_id": node_id, "last_seen": time.time()}
+    if is_new:
+        TELEMETRY.inc("inbound_peer_new")
+        print(f"[✓] Inbound peer (dialed in over the internet/LAN): {ip} ({node_id[:8]})", flush=True)
+    return {"status": "OK", "seen_ip": ip, "node_id": STATE.node_id, "version": VERSION}, 200
+
+def inbound_peer_fresh(ip: str) -> bool:
+    with STATE.lock:
+        p = STATE.inbound_peers.get(ip)
+        return bool(p and time.time() - p["last_seen"] < INBOUND_PEER_TTL)
+
+def say_hello(host: str, port: int) -> dict:
+    """Client side: introduce ourselves so a peer that can't dial us back still serves catch-up."""
+    code, resp, _ = _peer_post(host, port, "/p2p/hello", make_hello(), timeout=6.0)
+    return resp if code == 200 else {}
+
+def request_dialback(host: str, port: int, my_port: int) -> dict:
+    """Ask a peer to open TCP back to our public address (WanProbe). Old peers answer 404 -> {}."""
+    say_hello(host, port)
+    code, resp, _ = _peer_post(host, port, "/p2p/dialback", {"port": int(my_port)}, timeout=8.0)
+    return resp if code == 200 else {}
+
+def answer_dialback(data, ip: str) -> tuple:
+    try:
+        port = int((data or {}).get("port", P2P_SYNC_PORT))
+    except (TypeError, ValueError):
+        return {"status": "ERROR", "message": "port must be a number"}, 400
+    if not 0 < port < 65536:
+        return {"status": "ERROR", "message": "port out of range"}, 400
+    now = time.time()
+    with STATE.lock:
+        if len(STATE.dialback_last) > 4096:
+            STATE.dialback_last = {k: t for k, t in STATE.dialback_last.items() if now - t < DIALBACK_MIN_GAP_S}
+        if now - STATE.dialback_last.get((ip, port), 0) < DIALBACK_MIN_GAP_S:
+            return {"status": "ERROR", "message": "one dial-back per address per 30 s"}, 429
+        STATE.dialback_last[(ip, port)] = now
+    return omni_wan.dialback_check(ip.split("%", 1)[0], port), 200
+
+def signal_peers() -> list:
+    """Peers we can dial to forward / pull signaling (same set as catch-up), capped."""
+    return catchup_peers()[:8]
+
+def forward_signal(msg: dict):
+    """Best effort: copy a signed signaling message to every reachable peer (one hop)."""
+    body = {k: msg[k] for k in ("to", "from", "call_id", "kind", "payload", "ts", "sig")}
+    def one(host, port):
+        try:
+            code, _, _ = _peer_post(host, port, "/p2p/signal/send", body, timeout=5.0)
+            TELEMETRY.inc("signal_forward_ok" if code == 200 else "signal_forward_refused")
+        except Exception:
+            TELEMETRY.inc("signal_forward_failed")
+    for host, port in signal_peers():
+        threading.Thread(target=one, args=(host, port), daemon=True).start()
+
+def pull_signals(query: str):
+    """While an app long-polls here, run the same signed poll on each peer and queue what comes back."""
+    params = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+    params.pop("since", None)
+    params.pop("epoch", None)
+    fwd = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
+    def one(host, port):
+        try:
+            say_hello(host, port)
+            code, resp, _ = _peer_post(host, port, "/p2p/signal/poll", {"query": fwd}, timeout=SIGNAL_MAX_LONG_POLL_S + 5)
+            if code != 200:
+                return
+            for m in resp.get("messages", []):
+                try:
+                    msg = validate_signal_message({k: m.get(k) for k in SIGNAL_SEND_FIELDS})
+                    SIGNAL_MAILBOX.send(msg)
+                    TELEMETRY.inc("signal_pulled")
+                except SignalError:
+                    pass      # duplicate (409) or expired: already have it / too late
+        except Exception:
+            TELEMETRY.inc("signal_pull_failed")
+    for host, port in signal_peers():
+        threading.Thread(target=one, args=(host, port), daemon=True).start()
 
 def _peer_post(host: str, port: int, path: str, obj: dict, timeout: float = 10.0) -> tuple:
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
@@ -2548,6 +2668,10 @@ def reconcile_with_peer(host: str, port: int) -> dict:
     stats = {"peer": f"{host}:{port}", "rounds": 0, "bytes": 0, "need": 0, "have": 0, "stored": 0,
              "already": 0, "rejected": 0, "missing": 0, "pushed": 0, "push_failed": 0, "error": None}
     try:
+        try:
+            say_hello(host, port)        # lets a peer that can't dial us back serve this catch-up
+        except Exception:
+            pass
         ne = neg.Negentropy(neg.Storage(load_reconcile_items()))
         msg = ne.initiate()
         have, need = [], []
@@ -3219,6 +3343,9 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "peer_ips": peer_ips,
                 "uptime_seconds": uptime,
                 "catchup": STATE.last_catchup,
+                "wan": WAN.snapshot() if WAN else None,
+                "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
+                                     if now - v["last_seen"] < INBOUND_PEER_TTL),
             }
             body = json.dumps(resp_data).encode("utf-8")
             self.send_response(200)
@@ -3610,6 +3737,41 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _p2p_v821(self):
+        """v8.21.0 peer endpoints. Mesh header first; hello is open to any same-mesh node (signed),
+        the rest only to known peers (discovered, OMNI_SYNC_PEERS, radio/manual, or a fresh hello)."""
+        their_mesh = self.headers.get(MESH_HEADER)
+        if their_mesh is None or their_mesh.strip() != STATE.mesh_id:
+            self.reject_mesh(their_mesh)
+            return
+        ip = self.client_address[0]
+        if self.path != "/p2p/hello" and not catchup_peer_allowed(ip):
+            _deny(self, 403, "say /p2p/hello first (signed by your node key)")
+            return
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = -1
+        if n <= 0 or n > 64 * 1024:
+            _deny(self, 413, "body missing or too large")
+            return
+        try:
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception as e:
+            self._json_reply(400, {"status": "ERROR", "message": f"Bad Request: {e}"})
+            return
+        if self.path == "/p2p/hello":
+            resp, code = accept_hello(data, ip)
+        elif self.path == "/p2p/dialback":
+            resp, code = answer_dialback(data, ip)
+        elif self.path == "/p2p/signal/send":
+            resp, code = signal_send(data, forward=False)      # one hop: never re-forwarded
+        else:
+            q = data.get("query") if isinstance(data, dict) else None
+            resp, code = signal_poll(q, pull=False) if isinstance(q, str) else (
+                {"status": "ERROR", "message": "'query' must be the signed poll query string"}, 400)
+        self._json_reply(code, resp)
+
     def do_POST(self):
         if self.path in ("/p2p/reconcile", "/p2p/events"):
             # Catch-up sync (v8.8.0). Mesh first (403, unread), then only loopback / known peers (403):
@@ -3642,6 +3804,9 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
             TELEMETRY.inc("catchup_served_reconcile" if self.path == "/p2p/reconcile" else "catchup_served_events")
             self._json_reply(status_code, resp_data)
             return
+        if self.path in ("/p2p/hello", "/p2p/dialback", "/p2p/signal/send", "/p2p/signal/poll"):
+            self._p2p_v821()
+            return
         if self.path == "/p2p/sync":
             their_mesh = self.headers.get(MESH_HEADER)
             if their_mesh is None or their_mesh.strip() != STATE.mesh_id:
@@ -3673,7 +3838,10 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Endpoint Not Found")
 
+WAN = None
+
 def main():
+    global WAN
     force_utf8_console()
     db_file = init_db()
     print("==================================================================")
@@ -3736,6 +3904,10 @@ def main():
     for srv in servers:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     t3.start()   # after the servers are up, so peers can reconcile back with us
+    WAN = omni_wan.WanProbe(P2P_SYNC_PORT, lambda: LOCAL_IP, catchup_peers, request_dialback)
+    threading.Thread(target=WAN.run_forever, name="omni-wan", daemon=True).start()
+    print(f"[✓] Internet check (v8.21.0): STUN + UPnP {'on' if WAN.upnp_on else 'off (OMNI_UPNP=0)'} + dial-back; "
+          f"see node-health 'wan'", flush=True)
 
     try:
         while True:
