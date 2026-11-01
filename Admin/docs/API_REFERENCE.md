@@ -24,6 +24,7 @@ returns. Values are made up.
 | Social | GET | `/api/social/thread` | 5000 | yes | [→](#get-apisocialthread) |
 | Social | GET | `/api/social/counts` | 5000 | yes | [→](#get-apisocialcounts) |
 | Profiles/Contacts | POST | `/api/profile/update` | 5000 | yes | [→](#post-apiprofileupdate) |
+| Profiles/Contacts | POST | `/api/profile/social-import` (v8.23.0) | 5000 | yes | [→](#post-apiprofilesocial-import) |
 | Profiles/Contacts | GET | `/api/profile` | 5000 | yes | [→](#get-apiprofile) |
 | Profiles/Contacts | GET | `/api/profile/list` | 5000 | yes | [→](#get-apiprofilelist) |
 | Profiles/Contacts | POST | `/api/contacts/verify` | 5000 | yes | [→](#post-apicontactsverify) |
@@ -296,6 +297,11 @@ and codes as the Social writes above. Payload: `schema: 1`, `handle` (3–20 `a-
 {"status": "SUCCESS", "event_id": "0x…", "merkle_hash": "0x…", "ts": 1793334636472,
  "author_pubkey": "ab12…", "action": "profile_update"}
 ```
+
+#### POST /api/profile/social-import
+v8.23.0; 5000; loopback or bearer. Person-signed `PROFILE_SOCIAL_IMPORT` event from Continuity-Engine, same
+envelope and codes as `/api/profile/update`, body ≤ 128 KB, max 500 contacts. Payload fields and limits:
+[SOCIAL_IMPORT.md](SOCIAL_IMPORT.md). `/api/events/append` refuses this action (403). **Live-tested (v8.23.0).**
 
 #### GET /api/profile
 5000; loopback or bearer. Query: `pubkey=<64 hex>`. The latest signed `ts` wins. **From code, not live-tested.**

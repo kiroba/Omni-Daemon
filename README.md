@@ -17,6 +17,7 @@ The networked protocol layer of The Omniverse. One daemon runs on each device. I
 | Call relay (v8.22, in review) | Built-in STUN + TURN (UDP 3478, relay ports 49160-49200). Desktops relay by default; phones only when Omni Node turns it on. Apps get this node's relay plus up to four peers' relays. No third-party STUN/TURN when an Omni relay is known | `RELAY.md` |
 | OmniCast signaling | Memory-only, signed mailbox `/api/signal/{send,poll,ice-config}` | `OMNICAST_SIGNALING.md` |
 | Remote hub | Opt-in, bearer token, for use over Tailscale | `REMOTE_HUB.md` |
+| Social import (v8.23, in review) | Person-signed `PROFILE_SOCIAL_IMPORT` events from Continuity-Engine on `POST /api/profile/social-import`: blind-hashed contacts only, max 500 per event | `SOCIAL_IMPORT.md` |
 
 ## No third-party servers
 Calls connect directly when they can (LAN, IPv6, hole punching) and otherwise relay through another Omni node. Nothing depends on hosted TURN/STUN. The relay has caps (allocations, kbps, MB per day) and refuses to relay to loopback, link-local or multicast addresses; LAN and carrier-NAT targets need `OMNI_RELAY_ALLOW_PRIVATE=1`.

@@ -57,6 +57,9 @@ events keyed to a post id (the app_event_id KickBack shows); GET /api/social/thr
 comments and reaction counts, GET /api/social/counts?post_ids=a,b returns per-post counts for a feed.
 Reactions toggle (latest signed ts per person+post+reaction wins). Remote hub allowed with the bearer
 token. See Admin/docs/SOCIAL.md.
+Social profile import (v8.23.0): POST :5000/api/profile/social-import takes a person-signed
+PROFILE_SOCIAL_IMPORT event from kiroba/Continuity-Engine (blind-hashed contacts only, max 500 per
+event, 128 KB body). /api/events/append refuses that action. See Admin/docs/SOCIAL_IMPORT.md.
 Signed credit transfers (v8.15.0): POST :5000/api/credits/send takes a transfer signed by the "from"
 key (kinds transfer/purchase/tip, optional ref such as a post id, unique nonce, ts within 10 min). The
 signature, nonce and ts are stored inside the ledger entry and re-verified on every replay; a reused
@@ -101,7 +104,7 @@ import urllib.parse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.22.0"
+VERSION = "8.23.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -165,7 +168,7 @@ REMOTE_GET_PATHS = {"/api/events/feed", "/api/events/stats", "/api/events/list",
 REMOTE_POST_PATHS = {"/api/events/append", "/api/bugs/report", "/api/signal/send",
                      "/api/profile/update", "/api/contacts/verify", "/api/invites/create",
                      "/api/social/comment", "/api/social/react", "/api/credits/send",
-                     "/api/telemetry/app-checkin"}
+                     "/api/telemetry/app-checkin", "/api/profile/social-import"}
 _APP_ENVELOPE_KEYS = ("app_event_id", "app_author_pubkey", "app_signature", "app_previous_hash",
                       "app_ts", "app_timestamp")
 
@@ -1678,6 +1681,73 @@ def social_counts(query: str) -> tuple:
 
 RESERVED_USER_ACTIONS[COMMENT_ACTION] = "/api/social/comment"
 RESERVED_USER_ACTIONS[REACTION_ACTION] = "/api/social/react"
+
+# --- Continuity-Engine social profile import (v8.23.0): person-signed, schema-checked ---------------
+# kiroba/Continuity-Engine integrations/continuity_social_import_engine.py signs a PROFILE_SOCIAL_IMPORT
+# event with the person's Ed25519 key in the canonical envelope (same as profiles). The payload is the
+# engine's import_external_profile() output, checked field by field here: blind-hashed contacts only
+# (sha256 hex, never raw emails or phone numbers), a hard cap on contacts and on the body. Stored as
+# signed and relayed like other person-signed events; there is no read endpoint yet (the events show in
+# /api/events/feed). See Admin/docs/SOCIAL_IMPORT.md.
+SOCIAL_IMPORT_ACTION = "PROFILE_SOCIAL_IMPORT"
+SOCIAL_IMPORT_MAX_BYTES = 128 * 1024        # whole POST body
+SOCIAL_IMPORT_MAX_CONTACTS = 500
+SOCIAL_IMPORT_FIELDS = {"import_event_id", "platform_source", "external_handle", "imported_bio",
+                        "total_contacts_imported", "contact_blind_hashes", "fanbase_bootstrap_status"}
+SOCIAL_IMPORT_CONTACT_FIELDS = {"display_name", "blind_hash", "platform"}
+SOCIAL_IMPORT_STATUSES = {"PENDING_P2P_MATCHING"}
+SOCIAL_IMPORT_TEXT = {"platform_source": 32, "external_handle": 100, "imported_bio": 1000}
+SOCIAL_IMPORT_NAME_MAX = 64
+_UUID4_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+_BLIND_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _trimmed_text(value, name: str, max_len: int, multiline: bool = False, allow_empty: bool = False) -> str:
+    if _clean_text(value, name, max_len, multiline=multiline) != value:
+        raise ValueError(f"'{name}' has control characters or surrounding spaces; send it trimmed")
+    if not allow_empty and not value:
+        raise ValueError(f"'{name}' must be a non-empty string")
+    return value
+
+
+def validate_social_import(p) -> dict:
+    if not isinstance(p, dict):
+        raise ValueError("payload must be an object")
+    if set(p) != SOCIAL_IMPORT_FIELDS:
+        missing, unknown = SOCIAL_IMPORT_FIELDS - set(p), set(p) - SOCIAL_IMPORT_FIELDS
+        raise ValueError("social import payload fields are exactly " + ", ".join(sorted(SOCIAL_IMPORT_FIELDS))
+                         + (f" (unknown: {', '.join(sorted(unknown))})" if unknown else "")
+                         + (f" (missing: {', '.join(sorted(missing))})" if missing else ""))
+    if not isinstance(p["import_event_id"], str) or not _UUID4_RE.fullmatch(p["import_event_id"]):
+        raise ValueError("'import_event_id' must be a lowercase UUID4 string")
+    _trimmed_text(p["platform_source"], "platform_source", SOCIAL_IMPORT_TEXT["platform_source"])
+    if p["platform_source"] != p["platform_source"].upper():
+        raise ValueError("'platform_source' must be upper case (e.g. X_TWITTER)")
+    _trimmed_text(p["external_handle"], "external_handle", SOCIAL_IMPORT_TEXT["external_handle"])
+    _trimmed_text(p["imported_bio"], "imported_bio", SOCIAL_IMPORT_TEXT["imported_bio"], multiline=True,
+                  allow_empty=True)
+    if p["fanbase_bootstrap_status"] not in SOCIAL_IMPORT_STATUSES:
+        raise ValueError(f"'fanbase_bootstrap_status' must be one of: {', '.join(sorted(SOCIAL_IMPORT_STATUSES))}")
+    contacts = p["contact_blind_hashes"]
+    if not isinstance(contacts, list):
+        raise ValueError("'contact_blind_hashes' must be a list")
+    if len(contacts) > SOCIAL_IMPORT_MAX_CONTACTS:
+        raise ValueError(f"at most {SOCIAL_IMPORT_MAX_CONTACTS} contacts per import event")
+    n = p["total_contacts_imported"]
+    if not isinstance(n, int) or isinstance(n, bool) or n != len(contacts):
+        raise ValueError("'total_contacts_imported' must be the number of entries in 'contact_blind_hashes'")
+    for i, c in enumerate(contacts):
+        if not isinstance(c, dict) or set(c) != SOCIAL_IMPORT_CONTACT_FIELDS:
+            raise ValueError(f"contact {i}: fields are exactly display_name, blind_hash, platform")
+        _trimmed_text(c["display_name"], f"contact {i} display_name", SOCIAL_IMPORT_NAME_MAX, allow_empty=True)
+        if not isinstance(c["blind_hash"], str) or not _BLIND_HASH_RE.fullmatch(c["blind_hash"]):
+            raise ValueError(f"contact {i}: 'blind_hash' must be 64 lowercase hex (sha256), never a raw identifier")
+        if not isinstance(c["platform"], str) or c["platform"].upper() != p["platform_source"]:
+            raise ValueError(f"contact {i}: 'platform' must match 'platform_source'")
+    return p
+
+
+RESERVED_USER_ACTIONS[SOCIAL_IMPORT_ACTION] = "/api/profile/social-import"
 
 # --- Omni Credits TEST ledger (v8.10.0): closed-loop, replayed from signed chain events -----------
 # Every ledger entry is a node-signed chain event with action "credit_entry", appended through the
@@ -3629,6 +3699,8 @@ USER_POST_ROUTES = {
     "/api/invites/create": (8 * 1024, lambda h, d: invites_create(d)),
     "/api/social/comment": (USER_EVENT_MAX_BYTES, lambda h, d: store_user_event(d, {COMMENT_ACTION: validate_comment}, _via(h))),
     "/api/social/react": (USER_EVENT_MAX_BYTES, lambda h, d: store_user_event(d, {REACTION_ACTION: validate_reaction}, _via(h))),
+    "/api/profile/social-import": (SOCIAL_IMPORT_MAX_BYTES, lambda h, d: store_user_event(
+        d, {SOCIAL_IMPORT_ACTION: validate_social_import}, _via(h))),
     "/api/telemetry/app-checkin": (4 * 1024, lambda h, d: app_checkin(d)),
 }
 
