@@ -41,7 +41,7 @@ string, by name, for buttons and dialogs), `colors`, plus one block per section:
 - `radios {line, color, ask_permission}`: phones only. It is null when the shell sends no `radios` env.
 - `internet {title, line, color, address, switch, on, hint}`
 - `relay {section, title, on, hint, line, color, cap_mb, cap_title, caps:[{mb,label}]}`
-- `peers {title, hint, button, items:[{key,label,color}]}`
+- `peers {title, hint, button, items:[{key,label,color,remove_title,remove_body}]}`
 - `pairing {title, hint, quiet_line, quiet_color, offer:{code,expiry,payload,howto,warning}|null, paired:[{pubkey,name,line,color,confirm}], none}`
 - `update {title, button, line, color, url, get, newer}`: the update banner
 - `background {title, label, on}`: shown only when the shell can start the node at sign-in

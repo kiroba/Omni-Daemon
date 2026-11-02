@@ -640,7 +640,8 @@ class NodeCore:
             peers = []
             for key in s["peers"]:
                 text, color = W.peer_line(key, self.peer_state.get(key, "") if on else "")
-                peers.append({"key": key, "label": text, "color": color})
+                peers.append({"key": key, "label": text, "color": color, "remove_title": W.peer_remove_title(key),
+                              "remove_body": W.PEER_REMOVE_BODY})
 
             quiet = (h or {}).get("quiet") or ((self.pairing or {}).get("quiet") if on else None)
             q_text, q_color = W.quiet_line(quiet) if on else (W.QUIET_NETWORK_OFF, W.TEXT_3)
