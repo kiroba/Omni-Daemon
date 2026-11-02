@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from daemon_harness import ADMIN, Daemon, Key, daemon_module, http, now_ms  # noqa: E402
+from daemon_version import DAEMON_VERSION  # noqa: E402
 
 import omni_lpe as lpe  # noqa: E402  (daemon_harness put Admin/ on sys.path)
 
@@ -202,7 +203,7 @@ class Unit(unittest.TestCase):
 
     def test_daemon_registration_and_gate_sets(self):
         d = daemon_module()
-        self.assertEqual(d.VERSION, "8.25.0")
+        self.assertEqual(d.VERSION, DAEMON_VERSION)
         for p in ("/api/lpe/profile", "/api/lpe/plaza", "/api/lpe/reputation"):
             self.assertIn(p, d.USER_GET_ROUTES)
             self.assertIn(p, d.REMOTE_GET_PATHS)

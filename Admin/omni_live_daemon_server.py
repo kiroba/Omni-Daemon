@@ -88,6 +88,12 @@ Live Persona Engine (v8.25.0): /api/lpe/{profile,plaza,vibe,progress,vote,reputa
 loopback-only /api/lpe/quarantine). Avatars, idle progress, vibe boosts and reputation votes are
 person-signed lpe_* chain events; state and a pre-alpha EigenTrust-style trust score are replayed from
 them by Admin/omni_lpe.py (lazy-loaded). See Admin/docs/LPE_API.md.
+OmniMind world library (v8.26.0): /api/omnimind/{world,world/{id},request,requests,signal,flag} on :5000
+(and loopback-only /api/omnimind/{review,approve,reject,fulfil}), plus the local Zodiac NPC generator at
+/api/v1/omnimind/generate-asset. Lore, places, NPCs, quests, items and asset refs are signed, versioned
+omnimind_* chain events replayed by Admin/omni_omnimind.py (lazy-loaded). OMNI_OMNIMIND_ROLE=full nodes
+fulfil requests. Human Feed Policy: payloads tagged feed_injectable=false are refused outside omnimind_*
+and left out of /api/events/feed. See Admin/docs/OMNIMIND_WORLD.md.
 ==============================================================================
 """
 
@@ -120,7 +126,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.25.0"
+VERSION = "8.26.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -4553,6 +4559,278 @@ REMOTE_POST_PATHS.update(LPE_REMOTE_POST_PATHS)
 RESERVED_USER_ACTIONS.update(LPE_PERSON_ACTIONS)
 RESERVED_USER_ACTIONS[LPE_NODE_ACTION] = "/api/lpe/quarantine"
 # === end LPE hooks ===============================================================================
+
+
+# === OmniMind: world library hooks (v8.26.0) ======================================================
+# All logic lives in Admin/omni_omnimind.py, imported on the first /api/omnimind/* (or
+# /api/v1/omnimind/*) request (stdlib only, so it loads under Chaquopy). Events: omnimind_request,
+# omnimind_signal, omnimind_flag (person-signed), omnimind_world_entry / omnimind_asset_ref /
+# omnimind_review (an owner key, or this node when it is an owner or autopublishes), omnimind_proposal /
+# omnimind_capability / omnimind_checkpoint (node-signed). All are stored and relayed like LPE person
+# events and sync over the existing catch-up path. Same remote_gate as every :5000 path: reads and the
+# person-signed writes are remote-allowed, review / approve / reject / fulfil are loopback only.
+# The existing /api/omnimind/telemetry (TelemetryHandler, :9100) is untouched. See Admin/docs/OMNIMIND_WORLD.md.
+OMNIMIND_PERSON_ACTIONS = {"omnimind_request": "/api/omnimind/request", "omnimind_signal": "/api/omnimind/signal",
+                           "omnimind_flag": "/api/omnimind/flag", "omnimind_world_entry": "/api/omnimind/approve",
+                           "omnimind_asset_ref": "/api/omnimind/approve", "omnimind_review": "/api/omnimind/reject"}
+OMNIMIND_NODE_ACTIONS = ("omnimind_proposal", "omnimind_capability", "omnimind_checkpoint")
+OMNIMIND_ACTIONS = tuple(OMNIMIND_PERSON_ACTIONS) + OMNIMIND_NODE_ACTIONS
+OMNIMIND_GET_PATHS = ("/api/omnimind/world", "/api/omnimind/requests", "/api/omnimind/review",
+                      "/api/v1/omnimind/generate-asset")
+OMNIMIND_REMOTE_GET_PATHS = ("/api/omnimind/world", "/api/omnimind/requests", "/api/v1/omnimind/generate-asset")
+OMNIMIND_WORLD_ITEM_PREFIX = "/api/omnimind/world/"    # + entry id, event id or asset sha256
+OMNIMIND_POST_PATHS = {"/api/omnimind/request": 4 * 1024, "/api/omnimind/signal": 2 * 1024,
+                       "/api/omnimind/flag": 2 * 1024, "/api/omnimind/approve": 32 * 1024,
+                       "/api/omnimind/reject": 4 * 1024, "/api/omnimind/fulfil": 1024}
+OMNIMIND_REMOTE_POST_PATHS = ("/api/omnimind/request", "/api/omnimind/signal", "/api/omnimind/flag")
+_OMNIMIND_ITEM_RE = re.compile(r"(?:0x[0-9a-f]{64}|[0-9a-f]{64}|[a-z0-9][a-z0-9_-]{1,47})")
+
+
+def _omnimind_int_env(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, str(default)))))
+    except ValueError:
+        return default
+
+
+def _omnimind_owners() -> frozenset:
+    """OMNI_OMNIMIND_OWNERS: comma-separated 64-hex keys and/or "self" (this node). Default "self".
+    Anything else is ignored with a warning (never widened)."""
+    owners = set()
+    for part in os.environ.get("OMNI_OMNIMIND_OWNERS", "self").split(","):
+        part = part.strip().lower()
+        if part == "self":
+            owners.add(STATE.node_id)
+        elif _PUBKEY_RE.fullmatch(part):
+            owners.add(part)
+        elif part:
+            sys.stderr.write(f"[!] OMNI_OMNIMIND_OWNERS: ignoring {part[:16]!r} (not a 64-hex key or 'self')\n")
+    return frozenset(owners)
+
+
+OMNIMIND_ROLE = "full" if os.environ.get("OMNI_OMNIMIND_ROLE", "").strip().lower() == "full" else "mini"
+OMNIMIND_AUTOPUBLISH = os.environ.get("OMNI_OMNIMIND_AUTOPUBLISH", "").strip() == "1"   # default: review everything
+OMNIMIND_LLM_URL = os.environ.get("OMNI_OMNIMIND_LLM_URL", "").strip()
+if OMNIMIND_LLM_URL and not re.match(r"https?://", OMNIMIND_LLM_URL):
+    sys.stderr.write("[!] OMNI_OMNIMIND_LLM_URL must start with http:// or https://; LLM backend off\n")
+    OMNIMIND_LLM_URL = ""
+OMNIMIND_LLM_MODEL = os.environ.get("OMNI_OMNIMIND_LLM_MODEL", "").strip() or "llama3.2"
+OMNIMIND_GPU = os.environ.get("OMNI_OMNIMIND_GPU", "").strip() == "1"
+OMNIMIND_OWNERS = _omnimind_owners()
+# kiroba/Omni-Node-Daemon scripts/fetch_daemon.sh packages every module named on a line that starts
+# with "import omni_..."; the import below is lazy (indented), so this string names it for the APK:
+_OMNIMIND_PACKAGING_HINT = """
+import omni_omnimind
+"""
+_OMNIMIND_MODULE = None
+_OMNIMIND_CACHE = {"key": None, "events": []}
+_OMNIMIND_CACHE_LOCK = threading.Lock()
+
+
+def omnimind_module():
+    global _OMNIMIND_MODULE
+    if _OMNIMIND_MODULE is None:
+        import omni_omnimind
+        _OMNIMIND_MODULE = omni_omnimind
+    return _OMNIMIND_MODULE
+
+
+def omnimind_events(db_path: Path = None) -> list:
+    """Every stored omnimind_* event whose Ed25519 signature re-verifies, as dicts. Cached until an
+    omnimind row is added (same pattern as lpe_events)."""
+    db_path = db_path or _db_path()
+    if not db_path.exists():
+        return []
+    marks = ",".join("?" for _ in OMNIMIND_ACTIONS)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        key = conn.execute(f"SELECT COALESCE(MAX(id), 0), COUNT(*) FROM events WHERE action IN ({marks})",
+                           OMNIMIND_ACTIONS).fetchone()
+        with _OMNIMIND_CACHE_LOCK:
+            if _OMNIMIND_CACHE["key"] == (str(db_path), *key):
+                return _OMNIMIND_CACHE["events"]
+        rows = conn.execute("SELECT id, event_id, action, author_pubkey, previous_hash, timestamp, payload_json, "
+                            f"signature, ts_ms FROM events WHERE action IN ({marks}) ORDER BY id ASC",
+                            OMNIMIND_ACTIONS).fetchall()
+    finally:
+        conn.close()
+    events = [e for e in (_row_to_feed_event(r) for r in rows) if e["verified"] and "ts" in e]
+    with _OMNIMIND_CACHE_LOCK:
+        _OMNIMIND_CACHE.update(key=(str(db_path), *key), events=events)
+    return events
+
+
+class _OmniMindCtx:
+    """What omni_omnimind needs from the daemon, and nothing else."""
+    node_id = property(lambda self: STATE.node_id)
+    role = OMNIMIND_ROLE
+    owners = OMNIMIND_OWNERS
+    autopublish = OMNIMIND_AUTOPUBLISH
+    llm_url = OMNIMIND_LLM_URL
+    llm_model = OMNIMIND_LLM_MODEL
+    llm_timeout = _omnimind_int_env("OMNI_OMNIMIND_LLM_TIMEOUT", 60, 2, 600)
+    gpu = OMNIMIND_GPU
+    flag_hide = _omnimind_int_env("OMNI_OMNIMIND_FLAG_HIDE", 3, 1, 1000)
+    max_per_pass = _omnimind_int_env("OMNI_OMNIMIND_MAX_PER_PASS", 5, 1, 100)
+    checkpoint_every = _omnimind_int_env("OMNI_OMNIMIND_CHECKPOINT_EVERY", 25, 1, 100000)
+    cas_dir = os.environ.get("OMNI_OMNIMIND_CAS_DIR", "").strip() or str(Path.home() / ".omni" / "omnimind" / "cas")
+
+    @staticmethod
+    def events():
+        return omnimind_events()
+
+    @staticmethod
+    def now_ms():
+        return now_ms()
+
+    @staticmethod
+    def parse_signed(data, validators):
+        ev = parse_user_event(data, validators)
+        if ev["author_pubkey"] == STATE.node_id:
+            raise ValueError("OmniMind person events must be signed by a person's key, not the node's")
+        if not user_event_signature_ok(ev):
+            raise PermissionError("bad signature: must be the author's Ed25519 signature over the canonical "
+                                  "event (action, author_pubkey, payload, previous_hash, ts)")
+        return ev
+
+    @staticmethod
+    def store_person(data, validators):
+        return store_user_event(data, validators, "omnimind")
+
+    @staticmethod
+    def store_node(action, payload):
+        return process_and_store_event({"action": action, "payload": payload}, origin_peer=None, relay=True)
+
+
+OMNIMIND_CTX = _OmniMindCtx()
+
+
+def _omnimind_get(path):
+    return lambda h, q: omnimind_module().GET_ROUTES[path](OMNIMIND_CTX, q)
+
+
+def _omnimind_post(path):
+    return lambda h, d: omnimind_module().POST_ROUTES[path](OMNIMIND_CTX, d)
+
+
+def _omnimind_world_item(h, q):
+    item = urllib.parse.unquote(h.path.partition("?")[0][len(OMNIMIND_WORLD_ITEM_PREFIX):])
+    return omnimind_module().get_world_item(OMNIMIND_CTX, item, q)
+
+
+def _is_omnimind_world_item(path) -> bool:
+    return (isinstance(path, str) and path.startswith(OMNIMIND_WORLD_ITEM_PREFIX)
+            and bool(_OMNIMIND_ITEM_RE.fullmatch(path[len(OMNIMIND_WORLD_ITEM_PREFIX):])))
+
+
+class _OmniMindGetRoutes(dict):
+    """USER_GET_ROUTES plus one parameterised path, GET /api/omnimind/world/{id}."""
+    def __contains__(self, path):
+        return dict.__contains__(self, path) or _is_omnimind_world_item(path)
+
+    def __getitem__(self, path):
+        if dict.__contains__(self, path):
+            return dict.__getitem__(self, path)
+        if _is_omnimind_world_item(path):
+            return _omnimind_world_item
+        raise KeyError(path)
+
+
+class _OmniMindRemoteGetPaths(set):
+    """REMOTE_GET_PATHS plus GET /api/omnimind/world/{id} (a read, remote-allowed like /world)."""
+    def __contains__(self, path):
+        return set.__contains__(self, path) or _is_omnimind_world_item(path)
+
+
+for _p in OMNIMIND_GET_PATHS:
+    USER_GET_ROUTES[_p] = _omnimind_get(_p)
+for _p, _max in OMNIMIND_POST_PATHS.items():
+    USER_POST_ROUTES[_p] = (_max, _omnimind_post(_p))
+USER_GET_ROUTES = _OmniMindGetRoutes(USER_GET_ROUTES)
+REMOTE_GET_PATHS = _OmniMindRemoteGetPaths(REMOTE_GET_PATHS)
+REMOTE_GET_PATHS.update(OMNIMIND_REMOTE_GET_PATHS)
+REMOTE_POST_PATHS.update(OMNIMIND_REMOTE_POST_PATHS)
+RESERVED_USER_ACTIONS.update(OMNIMIND_PERSON_ACTIONS)
+for _a in OMNIMIND_NODE_ACTIONS:
+    RESERVED_USER_ACTIONS[_a] = "(node-signed by an OmniMind full node, never via an API)"
+
+# Human Feed Policy: generated content never enters the human social feed. Writes: any event that is not
+# an omnimind_* event and carries "feed_injectable": false anywhere in its payload (or in a JSON string
+# inside it) is refused, whatever the path (/api/events/append, /api/social/*, remote apps, peers).
+# Reads: /api/events/feed leaves omnimind_* events and tagged payloads out unless ?type= asks for an
+# omnimind_* type explicitly (tools, not the feed).
+_FEED_BLOCK_RE = re.compile(r'"feed_injectable"\s*:\s*false')
+_process_and_store_event_before_omnimind = process_and_store_event
+_list_feed_events_before_omnimind = list_feed_events
+
+
+def feed_blocked(payload, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    if isinstance(payload, dict):
+        if payload.get("feed_injectable") is False:
+            return True
+        return any(feed_blocked(v, depth + 1) for v in payload.values())
+    if isinstance(payload, list):
+        return any(feed_blocked(v, depth + 1) for v in payload)
+    if isinstance(payload, str):
+        return "feed_injectable" in payload and bool(_FEED_BLOCK_RE.search(payload))
+    return False
+
+
+def process_and_store_event(data: dict, origin_peer: str = None, relay: bool = True) -> tuple:
+    action = str((data or {}).get("action", "USER_ACTION")).strip() if isinstance(data, dict) else ""
+    if isinstance(data, dict) and not action.startswith("omnimind_") and feed_blocked(data.get("payload")):
+        TELEMETRY.inc("events_rejected_feed_policy")
+        return {"status": "ERROR", "message": "Human Feed Policy: content tagged feed_injectable=false is "
+                                              "generated by OmniMind and can't be posted to the human feed"}, 403
+    return _process_and_store_event_before_omnimind(data, origin_peer, relay)
+
+
+def _feed_generated(ev: dict) -> bool:
+    return str(ev.get("action", "")).startswith("omnimind_") or feed_blocked(ev.get("payload"))
+
+
+def list_feed_events(limit: int = FEED_DEFAULT_LIMIT, before: int = None, since: int = None,
+                     etype: str = None, db_path: Path = None) -> dict:
+    if etype and etype.startswith("omnimind_"):
+        return _list_feed_events_before_omnimind(limit, before, since, etype, db_path)
+    limit = max(1, min(int(limit), FEED_MAX_LIMIT))
+    kept, cursor, first, page, hidden = [], before, None, None, 0
+    for _ in range(50):
+        page = _list_feed_events_before_omnimind(FEED_MAX_LIMIT, cursor, since, etype, db_path)
+        first = first or page
+        for ev in page["events"]:
+            if _feed_generated(ev):
+                hidden += 1
+            else:
+                kept.append(ev)
+        if len(kept) > limit or not page["has_more"]:
+            break
+        cursor = page["next_before"]
+    more = len(kept) > limit or bool(page and page["has_more"])
+    kept = kept[:limit]
+    out = dict(first or page)
+    out.update(limit=limit, events=kept, count=len(kept), has_more=more,
+               next_before=(kept[-1]["id"] if kept else (page or {}).get("next_before")) if more else None)
+    return out
+
+
+def _omnimind_worker_loop():
+    """Full nodes: one fulfilment pass every OMNI_OMNIMIND_POLL_S seconds (default 30)."""
+    poll = _omnimind_int_env("OMNI_OMNIMIND_POLL_S", 30, 5, 86400)
+    time.sleep(_omnimind_int_env("OMNI_OMNIMIND_STARTUP_DELAY", 5, 0, 3600))
+    while True:
+        try:
+            omnimind_module().worker_pass(OMNIMIND_CTX)
+        except Exception as e:
+            sys.stderr.write(f"[!] OmniMind worker pass failed: {type(e).__name__}: {e}\n")
+        time.sleep(poll)
+
+
+if OMNIMIND_ROLE == "full" and __name__ == "__main__":
+    threading.Thread(target=_omnimind_worker_loop, name="omni-omnimind", daemon=True).start()
+# === end OmniMind hooks ==========================================================================
 
 
 class ContinuityIPCHandler(BaseHTTPRequestHandler):
