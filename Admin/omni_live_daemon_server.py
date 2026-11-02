@@ -88,6 +88,9 @@ Live Persona Engine (v8.25.0): /api/lpe/{profile,plaza,vibe,progress,vote,reputa
 loopback-only /api/lpe/quarantine). Avatars, idle progress, vibe boosts and reputation votes are
 person-signed lpe_* chain events; state and a pre-alpha EigenTrust-style trust score are replayed from
 them by Admin/omni_lpe.py (lazy-loaded). See Admin/docs/LPE_API.md.
+Omni Node shared core (v8.27.0): GET /api/node/ui + POST /api/node/action + POST /api/wan/config on :5000,
+loopback + local token only. Admin/omni_node_core.py builds the Node screen for Android, desktop and later
+iOS (lazy-loaded). See Admin/docs/NODE_SHARED_CORE.md.
 OmniMind world library (v8.26.0): /api/omnimind/{world,world/{id},request,requests,signal,flag} on :5000
 (and loopback-only /api/omnimind/{review,approve,reject,fulfil}), plus the local Zodiac NPC generator at
 /api/v1/omnimind/generate-asset. Lore, places, NPCs, quests, items and asset refs are signed, versioned
@@ -126,7 +129,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.26.0"
+VERSION = "8.27.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -4831,6 +4834,88 @@ def _omnimind_worker_loop():
 if OMNIMIND_ROLE == "full" and __name__ == "__main__":
     threading.Thread(target=_omnimind_worker_loop, name="omni-omnimind", daemon=True).start()
 # === end OmniMind hooks ==========================================================================
+
+
+# === Omni Node shared core hooks (v8.27.0) =======================================================
+# The Node screen (status card, switches, peers, pairing, relay, internet, updates) is built once, in
+# Admin/omni_node_core.py, from omni_node_words.py. Android and the desktop window call it in-process;
+# these loopback routes serve the same state to tools and future shells. All three are loopback only
+# (never in REMOTE_*_PATHS, so remote_gate answers 403 off-box) and need the local token when it is on.
+#   GET  /api/node/ui                 -> NodeCore.ui_state() after a refresh()
+#   POST /api/node/action             {"action": "...", "args": {...}} -> NodeCore.do(); "network" and
+#                                     "start_at_login" belong to the app that runs the node (409 here)
+#   POST /api/wan/config              {"upnp": bool}: the Internet switch (router port via UPnP), live
+# kiroba/Omni-Node-Daemon scripts/fetch_daemon.sh packages every module named on a line that starts
+# with "import omni_..."; the imports below are lazy (indented), so this string names them for the APK:
+_NODE_CORE_PACKAGING_HINT = """
+import omni_node_core
+import omni_node_words
+"""
+_NODE_CORE = None
+_NODE_CORE_LOCK = threading.Lock()
+NODE_SHELL_ONLY_ACTIONS = ("network", "start_at_login")
+
+
+def node_core():
+    global _NODE_CORE
+    with _NODE_CORE_LOCK:
+        if _NODE_CORE is None:
+            import omni_node_core
+            _NODE_CORE = omni_node_core.NodeCore(
+                env={"can_stop_node": False, "auto_update_check": False},
+                client=omni_node_core.NodeClient(TELEMETRY_PORT, CONTINUITY_IPC_PORT,
+                                                 token_fn=lambda: STATE.local_token))
+        return _NODE_CORE
+
+
+def _node_loopback(h) -> bool:
+    return _is_loopback(h.client_address[0])
+
+
+def node_ui(h, q):
+    if not _node_loopback(h):
+        return {"status": "ERROR", "message": "loopback only"}, 403
+    core = node_core()
+    core.refresh()
+    return core.ui_state(take_toasts=False), 200     # "status" here is the status card, not "OK"
+
+
+def node_action(h, d):
+    if not _node_loopback(h):
+        return {"status": "ERROR", "message": "loopback only"}, 403
+    if not isinstance(d, dict) or not isinstance(d.get("action"), str):
+        return {"status": "ERROR", "message": "body must be {\"action\": \"...\", \"args\": {...}}"}, 400
+    args = d.get("args", {})
+    if not isinstance(args, dict):
+        return {"status": "ERROR", "message": "args must be an object"}, 400
+    import omni_node_core
+    if d["action"] not in omni_node_core.ACTIONS:
+        return {"status": "ERROR", "message": f"unknown action; one of {', '.join(omni_node_core.ACTIONS)}"}, 400
+    if d["action"] in NODE_SHELL_ONLY_ACTIONS:
+        import omni_node_words
+        return {"status": "ERROR", "message": omni_node_words.NETWORK_HERE_ONLY}, 409
+    out = node_core().do(d["action"], args)
+    return dict(out, status="OK" if out.get("ok") else "ERROR"), 200
+
+
+def node_wan_config(h, d):
+    if not _node_loopback(h):
+        return {"status": "ERROR", "message": "loopback only"}, 403
+    if not isinstance(d, dict) or not isinstance(d.get("upnp"), bool):
+        return {"status": "ERROR", "message": "body must be {\"upnp\": true|false}"}, 400
+    if WAN is None:
+        return {"status": "ERROR", "message": "the internet check isn't running yet"}, 503
+    changed = WAN.upnp_on != d["upnp"]
+    WAN.upnp_on = d["upnp"]
+    if changed:
+        WAN.wake.set()                      # re-check now with the new setting
+    return {"status": "OK", "upnp": WAN.upnp_on}, 200
+
+
+USER_GET_ROUTES["/api/node/ui"] = node_ui
+USER_POST_ROUTES["/api/node/action"] = (8 * 1024, node_action)
+USER_POST_ROUTES["/api/wan/config"] = (1024, node_wan_config)
+# === end Omni Node shared core hooks =============================================================
 
 
 class ContinuityIPCHandler(BaseHTTPRequestHandler):

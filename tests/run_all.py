@@ -20,6 +20,7 @@ def main(argv):
     env = dict(os.environ)
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("OMNI_RELAY", "off")   # suites that test the built-in relay turn it on themselves
+    env.setdefault("OMNI_NODE_AUTO_UPDATE", "0")   # Node core: no daily GitHub release check from CI
     env["NO_PROXY"] = ",".join(filter(None, [env.get("NO_PROXY"), "127.0.0.1,localhost,::1"]))
     failed = []
     for name in suites:
