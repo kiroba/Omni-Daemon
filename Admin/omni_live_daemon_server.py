@@ -84,6 +84,10 @@ Signal poll epoch (v8.17.0): the mailbox cursor restarts at 0 when the hub resta
 holding an old cursor used to drop new messages as "already received". Poll/send answers now carry
 "epoch" (random per hub run); a poll whose epoch differs, or whose since is beyond the current cursor,
 is treated as since=0 and answers "cursor_reset": true. See Admin/docs/OMNICAST_SIGNALING.md.
+Live Persona Engine (v8.25.0): /api/lpe/{profile,plaza,vibe,progress,vote,reputation} on :5000 (and
+loopback-only /api/lpe/quarantine). Avatars, idle progress, vibe boosts and reputation votes are
+person-signed lpe_* chain events; state and a pre-alpha EigenTrust-style trust score are replayed from
+them by Admin/omni_lpe.py (lazy-loaded). See Admin/docs/LPE_API.md.
 ==============================================================================
 """
 
@@ -116,7 +120,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.24.0"
+VERSION = "8.25.0"
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -4420,6 +4424,135 @@ USER_POST_ROUTES = {
         d, {SOCIAL_IMPORT_ACTION: validate_social_import}, _via(h))),
     "/api/telemetry/app-checkin": (4 * 1024, lambda h, d: app_checkin(d)),
 }
+
+
+# === LPE: Live Persona Engine hooks (v8.25.0) ======================================================
+# All logic lives in Admin/omni_lpe.py, imported on the first /api/lpe/* request (stdlib only, so it
+# loads under Chaquopy). Events: lpe_profile, lpe_vibe_boost, lpe_progress_claim, lpe_reputation_vote
+# (person-signed, stored and relayed like profile_update) and lpe_quarantine (node-signed, not relayed,
+# only ever applied by the node that signed it). Same remote_gate as every :5000 path; the person-signed
+# writes and the reads are remote-allowed like /api/credits/send|balance|history, /api/lpe/quarantine is
+# loopback only like /api/credits/grant. See Admin/docs/LPE_API.md.
+LPE_PERSON_ACTIONS = {"lpe_profile": "/api/lpe/profile", "lpe_vibe_boost": "/api/lpe/vibe",
+                      "lpe_progress_claim": "/api/lpe/progress", "lpe_reputation_vote": "/api/lpe/vote"}
+LPE_NODE_ACTION = "lpe_quarantine"
+LPE_ACTIONS = tuple(LPE_PERSON_ACTIONS) + (LPE_NODE_ACTION,)
+LPE_GET_PATHS = ("/api/lpe/profile", "/api/lpe/plaza", "/api/lpe/reputation")
+LPE_POST_PATHS = {"/api/lpe/profile": 8 * 1024, "/api/lpe/vibe": 4 * 1024, "/api/lpe/progress": 4 * 1024,
+                  "/api/lpe/vote": 4 * 1024, "/api/lpe/quarantine": 2 * 1024}   # path -> max body bytes
+LPE_REMOTE_POST_PATHS = ("/api/lpe/profile", "/api/lpe/vibe", "/api/lpe/progress", "/api/lpe/vote")
+try:
+    LPE_VIBES_PER_DAY = max(1, min(100, int(os.environ.get("OMNI_LPE_VIBES_PER_DAY", "3"))))
+except ValueError:
+    LPE_VIBES_PER_DAY = 3
+# kiroba/Omni-Node-Daemon scripts/fetch_daemon.sh packages every module named on a line that starts
+# with "import omni_..."; the import below is lazy (indented), so this string names it for the APK:
+_LPE_PACKAGING_HINT = """
+import omni_lpe
+"""
+_LPE_MODULE = None
+_LPE_CACHE = {"key": None, "events": []}
+_LPE_CACHE_LOCK = threading.Lock()
+
+
+def lpe_module():
+    global _LPE_MODULE
+    if _LPE_MODULE is None:
+        import omni_lpe
+        _LPE_MODULE = omni_lpe
+    return _LPE_MODULE
+
+
+def lpe_events(db_path: Path = None) -> list:
+    """Every stored LPE event whose Ed25519 signature re-verifies (any author), as dicts. Cached until
+    an LPE row is added, so a GET doesn't re-verify the whole set."""
+    db_path = db_path or _db_path()
+    if not db_path.exists():
+        return []
+    marks = ",".join("?" for _ in LPE_ACTIONS)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        key = conn.execute(f"SELECT COALESCE(MAX(id), 0), COUNT(*) FROM events WHERE action IN ({marks})",
+                           LPE_ACTIONS).fetchone()
+        with _LPE_CACHE_LOCK:
+            if _LPE_CACHE["key"] == (str(db_path), *key):
+                return _LPE_CACHE["events"]
+        rows = conn.execute("SELECT id, event_id, action, author_pubkey, previous_hash, timestamp, payload_json, "
+                            f"signature, ts_ms FROM events WHERE action IN ({marks}) ORDER BY id ASC",
+                            LPE_ACTIONS).fetchall()
+    finally:
+        conn.close()
+    events = [e for e in (_row_to_feed_event(r) for r in rows) if e["verified"] and "ts" in e]
+    with _LPE_CACHE_LOCK:
+        _LPE_CACHE.update(key=(str(db_path), *key), events=events)
+    return events
+
+
+class _LpeCtx:
+    """What omni_lpe needs from the daemon, and nothing else."""
+    node_id = property(lambda self: STATE.node_id)
+    vibes_per_day = property(lambda self: LPE_VIBES_PER_DAY)
+
+    @staticmethod
+    def events():
+        return lpe_events()
+
+    @staticmethod
+    def now_ms():
+        return now_ms()
+
+    @staticmethod
+    def seeds():
+        """Pre-trusted keys: paired keys (if this daemon has them) plus the trusted-keys allowlist."""
+        seeds = set(getattr(STATE, "paired_keys", None) or ())
+        paired = getattr(STATE, "paired", None)          # v8.24.0 quiet mesh PairedStore, when merged
+        if paired is not None and callable(getattr(paired, "keys", None)):
+            try:
+                seeds |= set(paired.keys())
+            except Exception:
+                pass
+        seeds |= set(STATE.trusted_keys or ())
+        return seeds or None
+
+    @staticmethod
+    def parse_signed(data, validators):
+        ev = parse_user_event(data, validators)
+        if ev["author_pubkey"] == STATE.node_id:
+            raise ValueError("LPE person events must be signed by a person's key, not the node's")
+        if not user_event_signature_ok(ev):
+            raise PermissionError("bad signature: must be the author's Ed25519 signature over the canonical "
+                                  "event (action, author_pubkey, payload, previous_hash, ts)")
+        return ev
+
+    @staticmethod
+    def store_person(data, validators):
+        return store_user_event(data, validators, "lpe")
+
+    @staticmethod
+    def store_node(action, payload):
+        return process_and_store_event({"action": action, "payload": payload}, origin_peer=None, relay=False)
+
+
+LPE_CTX = _LpeCtx()
+
+
+def _lpe_get(path):
+    return lambda h, q: lpe_module().GET_ROUTES[path](LPE_CTX, q)
+
+
+def _lpe_post(path):
+    return lambda h, d: lpe_module().POST_ROUTES[path](LPE_CTX, d)
+
+
+for _p in LPE_GET_PATHS:
+    USER_GET_ROUTES[_p] = _lpe_get(_p)
+for _p, _max in LPE_POST_PATHS.items():
+    USER_POST_ROUTES[_p] = (_max, _lpe_post(_p))
+REMOTE_GET_PATHS.update(LPE_GET_PATHS)
+REMOTE_POST_PATHS.update(LPE_REMOTE_POST_PATHS)
+RESERVED_USER_ACTIONS.update(LPE_PERSON_ACTIONS)
+RESERVED_USER_ACTIONS[LPE_NODE_ACTION] = "/api/lpe/quarantine"
+# === end LPE hooks ===============================================================================
 
 
 class ContinuityIPCHandler(BaseHTTPRequestHandler):
