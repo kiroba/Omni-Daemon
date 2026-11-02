@@ -94,7 +94,7 @@ core carries over the old copies: desktop `~/.omni/node_desktop.json`, and Andro
 - **One relay policy.** The phone rule (charging + unmetered Wi-Fi) now also respects battery saver, and the core decides it for every platform.
 - **Internet switch** ("Open a port on my router"). This new switch flips the daemon's UPnP live through `POST /api/wan/config`, and the setting is passed as `OMNI_UPNP` when the node starts. When the switch is off, the node doesn't map a port. A mapping the router already made isn't removed; it expires on the router's own timer.
 - **Check for updates** (new). It reads `https://api.github.com/repos/kiroba/Omni-Node-Daemon/releases`, takes the newest non-draft release (pre-releases count), and compares it with the Node version. The check runs on demand and once a day. It is unauthenticated: GitHub sees the device's IP, and the limit is 60 requests an hour. `OMNI_NODE_UPDATE_URL` points it elsewhere (the tests use a local fake).
-- **The same Node version everywhere.** The version comes from `OMNI_NODE_VERSION`, else a `NODE_VERSION` file next to the core, else `dev`. The Omni-Node-Daemon release writes `NODE_VERSION` from its single `VERSION` file into the APK and into every desktop zip, so they match.
+- **The same Node version everywhere.** The version comes from `OMNI_NODE_VERSION`, else the generated module `omni_node_version.py`, else a `NODE_VERSION` file next to the core, else `dev`. The module comes first because an import works inside the APK even where data files may not be readable. The Omni-Node-Daemon build writes both the module and the file from its single `VERSION` file into the APK and into every desktop archive, so they match.
 - **Unified wording.** Where the two copies had drifted, one wording was kept: "Paste it **into** the app's Hub settings", "Only reachable on this **network** so far", and peer lines with ● syncing / ○ waiting.
 
 ## The daemon routes (loopback + local token)
@@ -137,7 +137,7 @@ Omni-Node-Daemon holds the single `VERSION` (for example `0.5.0`). One `v*` tag 
 `v0.5.0-prealpha`, which must start with `v<VERSION>`) builds the following, from one Omni-Daemon commit
 resolved once at the start of the run:
 
-- `app-debug.apk` (Android, with `NODE_VERSION` packaged)
+- `app-debug.apk` (Android, with `omni_node_version.py` packaged; CI checks it's inside the APK)
 - `omni-node-windows-x64.zip`, built the same way as The-Omniverse `omni-node-windows.yml`: Python sources, `Start Omni Node.cmd`, smoke-tested on windows-latest
 - `omni-node-linux.tar.gz` and `omni-node-macos.tar.gz`: the same sources plus `start-omni-node.sh`, smoke-tested on ubuntu-latest and macos-latest
 

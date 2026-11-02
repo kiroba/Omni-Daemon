@@ -70,9 +70,17 @@ EFFECTS = {
 # --------------------------------------------------------------------------- versions
 
 def node_version() -> str:
-    """The Omni Node version, identical on every platform: OMNI_NODE_VERSION, else a NODE_VERSION file
-    next to this module (written by the Omni-Node-Daemon build from its single VERSION file), else 'dev'."""
+    """The Omni Node version, identical on every platform: OMNI_NODE_VERSION, else the generated module
+    omni_node_version.py (an import works inside an APK, where data files may not be readable), else a
+    NODE_VERSION file next to this module, else 'dev'. The Omni-Node-Daemon build writes both from its
+    single VERSION file into the APK and every desktop archive."""
     v = os.environ.get("OMNI_NODE_VERSION", "").strip()
+    if not v:
+        try:
+            import omni_node_version
+            v = str(getattr(omni_node_version, "VERSION", "")).strip()
+        except ImportError:
+            v = ""
     if not v:
         try:
             v = (HERE / "NODE_VERSION").read_text(encoding="utf-8").strip()

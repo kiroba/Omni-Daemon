@@ -16,6 +16,7 @@ import ast
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -104,6 +105,10 @@ class Pure(unittest.TestCase):
         with mock.patch.dict(os.environ, {"OMNI_NODE_VERSION": ""}):
             expected = (ADMIN / "NODE_VERSION").read_text().strip() if (ADMIN / "NODE_VERSION").exists() else "dev"
             self.assertEqual(C.node_version(), expected)
+            fake = type(sys)("omni_node_version")
+            fake.VERSION = "0.5.0"
+            with mock.patch.dict(sys.modules, {"omni_node_version": fake}):
+                self.assertEqual(C.node_version(), "0.5.0")
         self.assertEqual(W.version_line("0.5.0", "8.27.0"), "Omni Node 0.5.0 · daemon v8.27.0")
         self.assertEqual(W.version_line("0.5.0"), "Omni Node 0.5.0")
 
@@ -426,7 +431,7 @@ class PackagingAndParity(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 names.add((node.module or "").split(".")[0])
         self.assertTrue(names <= {"json", "os", "re", "sys", "threading", "time", "urllib", "pathlib",
-                                  "omni_node_words"}, names)
+                                  "omni_node_words", "omni_node_version"}, names)   # the last is generated
 
     def test_desktop_shell_has_no_status_words(self):
         """The Tk shell renders ui_state(); a status sentence typed into it would drift from Android."""
