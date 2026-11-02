@@ -19,6 +19,7 @@ The networked protocol layer of The Omniverse. One daemon runs on each device. I
 | Remote hub | Opt-in, bearer token, for use over Tailscale | `REMOTE_HUB.md` |
 | Quiet mesh (v8.24, in review) | Pair devices with a 6-digit code or QR (`/api/pair/*`, loopback). Once paired, beacons carry only a rotating HMAC token on private subnets, and `:5005` closes silently for anyone who hasn't passed a signed challenge-response. `OMNI_QUIET_MESH=auto\|on\|off` | `QUIET_MESH.md` |
 | Social import (v8.23, in review) | Person-signed `PROFILE_SOCIAL_IMPORT` events from Continuity-Engine on `POST /api/profile/social-import`: blind-hashed contacts only, max 500 per event | `SOCIAL_IMPORT.md` |
+| Omni Node shared core (v8.27, in review) | One core (`omni_node_core.py` + `omni_node_words.py`) builds the Node screen for Android, desktop and later iOS; shells only render it. Loopback `GET /api/node/ui`, `POST /api/node/action`, `POST /api/wan/config` | `NODE_SHARED_CORE.md` |
 
 ## No third-party servers
 Calls connect directly when they can (LAN, IPv6, hole punching) and otherwise relay through another Omni node. Nothing depends on hosted TURN/STUN. The relay has caps (allocations, kbps, MB per day) and refuses to relay to loopback, link-local or multicast addresses; LAN and carrier-NAT targets need `OMNI_RELAY_ALLOW_PRIVATE=1`.

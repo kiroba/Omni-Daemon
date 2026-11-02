@@ -1,6 +1,6 @@
 # Omni Node on Windows, macOS and Linux
 
-The same screen as Omni Node on Android, for the computer that runs your daemon.
+The same screen as Omni Node on Android, for the computer that runs your daemon. Since v8.27.0 both are thin shells around one core (`omni_node_core.py`); see [NODE_SHARED_CORE.md](NODE_SHARED_CORE.md).
 
 ```
 python Admin/omni_node_desktop.py            # or double-click Admin/omni_node_desktop.pyw on Windows
@@ -18,8 +18,10 @@ pip install qrcode                           # optional: draw the pairing QR cod
 | Pair a device (daemon v8.24.0) | Show a code (6 digits, 5 minutes, 5 tries), Enter a code, the paired devices with Remove, and the Quiet mode line | Also shows the pairing text to paste, and draws the QR when the pure-Python `qrcode` package is installed (`pip install qrcode`); Enter a code accepts `123456 192.168.1.20` when the other device can't be found. See `QUIET_MESH.md` |
 | Background | | "Start when I sign in": per-user Run key on Windows, LaunchAgent on macOS, autostart file on Linux. No admin needed |
 
-The app starts the daemon with `OMNI_LOCAL_TOKEN=1` and `PYTHONUTF8=1`, exactly like the Android app, and logs it to `~/.omni/node_desktop_daemon.log`. Settings live in `~/.omni/node_desktop.json`.
+The app starts the daemon with `OMNI_LOCAL_TOKEN=1` and `PYTHONUTF8=1`, exactly like the Android app, and logs it to `~/.omni/node_desktop_daemon.log`. Settings live in `~/.omni/node_settings.json`, shared with the core (the old `~/.omni/node_desktop.json` is carried over on first start).
 
 With a tray icon, closing the window keeps the node running (like closing the Android app). Without one, closing the window quits and stops the node it started.
 
-Changing a status word? Change it in Omni Node's `NodeStatus.kt` / `MainActivity.kt` and in `omni_node_words.py` together. The test fails if they drift.
+Changing a word? Change it in `omni_node_words.py` only. Android and desktop both render it from the core, and CI fails if a shell spells out Node words itself.
+
+New in v8.27.0: an Internet switch ("Open a port on my router", UPnP on/off live), Check for updates (newest Omni Node release on GitHub, daily and on demand), and the Omni Node version line on the status card.
