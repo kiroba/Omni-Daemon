@@ -231,7 +231,8 @@ class TwoDaemonEncounters(unittest.TestCase):
             feed = B.get("/api/events/feed", {"limit": 200})[1]
             return set(before) <= {e["event_id"] for e in feed["events"]}
         self.assertTrue(_wait(b_has_all), self.enc(B))
-        self.assertGreaterEqual(self.enc(B)["healing"]["runs"], 1)
+        # Live relay can deliver them first; "runs" counts only once the catch-up has finished (slower on Windows).
+        self.assertTrue(_wait(lambda: self.enc(B)["healing"]["runs"] >= 1), self.enc(B))
 
         # --- 5. Ids rotate every 2 s here: more handshakes, but catch-up stays rate-limited (300 s).
         ok0 = self.enc(B)["handshakes"]["ok"]
