@@ -97,6 +97,12 @@ OmniMind world library (v8.26.0): /api/omnimind/{world,world/{id},request,reques
 omnimind_* chain events replayed by Admin/omni_omnimind.py (lazy-loaded). OMNI_OMNIMIND_ROLE=full nodes
 fulfil requests. Human Feed Policy: payloads tagged feed_injectable=false are refused outside omnimind_*
 and left out of /api/events/feed. See Admin/docs/OMNIMIND_WORLD.md.
+Game match results (v8.28.0): POST /api/games/match + GET /api/games/matches on :5000 (same gate as every
+:5000 path: loopback + local token, or remote hub + bearer). A match summary (e.g. Plaza Brawler's
+MatchShare.payloadFrom) is stored as a signed game_match chain event: node-signed for a bare summary, or
+the player's own Ed25519 signature when the app sends a signed envelope. Relayed and caught up like other
+events, kept out of /api/events/feed. node-health lists "games_match" in "features".
+See Admin/docs/GAMES_MATCH.md.
 ==============================================================================
 """
 
@@ -129,7 +135,10 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.27.0"
+VERSION = "8.28.0"
+# v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
+# so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
+NODE_FEATURES = []
 def _env_port(name: str, default: int) -> int:
     """Port override (e.g. to run two nodes on one machine for tests). Bad values fall back."""
     raw = os.environ.get(name, "").strip()
@@ -4354,6 +4363,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
                 "quiet": quiet_status(),
+                "features": list(NODE_FEATURES),
             }
             body = json.dumps(resp_data).encode("utf-8")
             self.send_response(200)
@@ -4916,6 +4926,160 @@ USER_GET_ROUTES["/api/node/ui"] = node_ui
 USER_POST_ROUTES["/api/node/action"] = (8 * 1024, node_action)
 USER_POST_ROUTES["/api/wan/config"] = (1024, node_wan_config)
 # === end Omni Node shared core hooks =============================================================
+
+
+# === Game match results (v8.28.0) ================================================================
+# POST /api/games/match stores one finished match (e.g. Plaza Brawler's MatchShare.payloadFrom, spec 5.3)
+# as a signed "game_match" chain event; GET /api/games/matches lists them newest first. Two body shapes:
+#   1. A bare summary {"game": "plaza_brawler", "winner": "p1", ...}: signed by THIS node (the app is
+#      trusted because it passed the loopback local token or the remote-hub bearer), like a bug report.
+#   2. A person-signed envelope {"action": "game_match", "author_pubkey", "previous_hash", "ts", "payload",
+#      "signature"[, "event_id"]}: the player's Ed25519 signature is verified (store_user_event) and the
+#      event is stored as signed, so peers see who played.
+# Both relay to peers and sync over catch-up like any other event. Match results are not posts, so
+# /api/events/feed leaves game_match out unless ?type=game_match asks for it. See Admin/docs/GAMES_MATCH.md.
+GAME_MATCH_ACTION = "game_match"
+GAME_MATCH_MAX_BYTES = 4 * 1024
+GAME_MATCH_SCHEMA = 1
+GAME_MATCH_DEFAULT_LIMIT = 20
+_GAME_ID_RE = re.compile(r"[a-z0-9][a-z0-9_]{0,31}")          # game, mode, signs, sources
+_GAME_WINNERS = ("p1", "p2", "draw")
+# field -> (kind, max): "id" = _GAME_ID_RE token, "int" = 0..max, "text" = trimmed string up to max chars.
+GAME_MATCH_FIELDS = {"game": ("id", 32), "mode": ("id", 32), "p1_sign": ("id", 32), "p2_sign": ("id", 32),
+                     "p1_source": ("id", 32), "p2_source": ("id", 32), "winner": ("winner", 0),
+                     "rounds": ("int", 99), "score": ("int", 1_000_000_000),
+                     "duration_ms": ("int", 24 * 3600 * 1000), "app_version": ("text", 32),
+                     "schema": ("schema", 0)}
+GAME_MATCH_REQUIRED = ("game", "winner")
+_GAME_LIST_ARGS = {"limit", "before", "game"}
+
+
+def validate_game_match(data) -> dict:
+    """The stored payload for one match summary, or ValueError. Unknown keys are refused (nothing
+    unexpected is stored or gossiped); a key whose value is null is treated as absent, because Dart maps
+    built from a summary carry nulls for missing fields."""
+    if not isinstance(data, dict):
+        raise ValueError("body must be a JSON object (a match summary)")
+    unknown = set(data) - set(GAME_MATCH_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown field(s): {', '.join(sorted(unknown))}")
+    clean = {}
+    for key, (kind, mx) in GAME_MATCH_FIELDS.items():
+        val = data.get(key)
+        if val is None:
+            continue
+        if kind == "id":
+            if not isinstance(val, str) or not _GAME_ID_RE.fullmatch(val.strip().lower()):
+                raise ValueError(f"'{key}' must be 1-32 chars of a-z 0-9 _ (starting with a letter or digit)")
+            clean[key] = val.strip().lower()
+        elif kind == "winner":
+            if val not in _GAME_WINNERS:
+                raise ValueError("'winner' must be \"p1\", \"p2\" or \"draw\"")
+            clean[key] = val
+        elif kind == "int":
+            if isinstance(val, bool) or not isinstance(val, int) or not 0 <= val <= mx:
+                raise ValueError(f"'{key}' must be an integer from 0 to {mx}")
+            clean[key] = val
+        elif kind == "text":
+            clean[key] = _clean_text(val, key, mx)
+            if not clean[key]:
+                del clean[key]
+        elif kind == "schema":
+            if val != GAME_MATCH_SCHEMA:
+                raise ValueError(f"'schema' must be {GAME_MATCH_SCHEMA}")
+    for key in GAME_MATCH_REQUIRED:
+        if key not in clean:
+            raise ValueError(f"'{key}' is required")
+    clean["schema"] = GAME_MATCH_SCHEMA
+    return clean
+
+
+def _game_match_validator(payload) -> dict:
+    """Validator for a person-signed envelope: the payload must already be exactly the clean form, since
+    the signature covers the bytes as sent (the node can't normalise them)."""
+    clean = validate_game_match(payload)
+    if clean != payload:
+        raise ValueError("signed payload must be normalised: lowercase ids, no nulls, trimmed text, "
+                         f"\"schema\": {GAME_MATCH_SCHEMA}")
+    return payload
+
+
+def store_game_match(h, data) -> tuple:
+    if isinstance(data, dict) and "signature" in data:
+        resp, status = store_user_event(data, {GAME_MATCH_ACTION: _game_match_validator}, _via(h))
+        signed_by = "player"
+    else:
+        try:
+            payload = validate_game_match(data)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}, 400
+        resp, status = process_and_store_event({"action": GAME_MATCH_ACTION, "payload": payload},
+                                               origin_peer=None, relay=True)
+        signed_by = "node"
+    if status == 200:
+        TELEMETRY.inc("games_match_stored")
+        resp = {"status": "SUCCESS", "event_id": resp.get("event_id"), "signed_by": signed_by,
+                "ts": resp.get("ts"), **({"result": resp["result"]} if resp.get("result") else {})}
+    return resp, status
+
+
+def list_game_matches(h, query) -> tuple:
+    try:
+        params = _query_args(query, _GAME_LIST_ARGS)
+        limit = _feed_int(params, "limit")
+        limit = GAME_MATCH_DEFAULT_LIMIT if limit is None else max(1, min(limit, FEED_MAX_LIMIT))
+        before = _feed_int(params, "before")
+        game = params["game"][-1].strip().lower() if params.get("game") else None
+        if game is not None and not _GAME_ID_RE.fullmatch(game):
+            raise ValueError("'game' must be 1-32 chars of a-z 0-9 _")
+    except ValueError as e:
+        return {"status": "ERROR", "message": str(e)}, 400
+    matches, cursor, more = [], before, False
+    for _ in range(50):          # skip invalid / unverified / other-game rows without short pages
+        page = _list_feed_events_before_omnimind(FEED_MAX_LIMIT, cursor, None, GAME_MATCH_ACTION)
+        for ev in page["events"]:
+            try:
+                match = validate_game_match(ev["payload"])
+            except ValueError:
+                continue         # a peer can relay anything; invalid ones are ignored on read
+            if not ev["verified"] or (game and match["game"] != game):
+                continue
+            matches.append({"id": ev["id"], "event_id": ev["event_id"], "ts_ms": ev["ts_ms"],
+                            "author_pubkey": ev["author_pubkey"],
+                            "signed_by": "node" if ev["author_pubkey"] == STATE.node_id else "other",
+                            "origin": ev["origin"], "verified": True, "match": match})
+        if len(matches) > limit or not page["has_more"]:
+            more = len(matches) > limit or page["has_more"]
+            break
+        cursor = page["next_before"]
+    matches = matches[:limit]
+    return {"status": "OK", "node_id": STATE.node_id, "version": VERSION, "limit": limit,
+            "count": len(matches), "has_more": bool(more),
+            "next_before": matches[-1]["id"] if more and matches else None, "matches": matches}, 200
+
+
+_list_feed_events_before_games = list_feed_events
+_feed_generated_before_games = _feed_generated
+
+
+def _feed_generated(ev: dict) -> bool:
+    return ev.get("action") == GAME_MATCH_ACTION or _feed_generated_before_games(ev)
+
+
+def list_feed_events(limit: int = FEED_DEFAULT_LIMIT, before: int = None, since: int = None,
+                     etype: str = None, db_path: Path = None) -> dict:
+    if etype == GAME_MATCH_ACTION:
+        return _list_feed_events_before_omnimind(limit, before, since, etype, db_path)
+    return _list_feed_events_before_games(limit, before, since, etype, db_path)
+
+
+USER_POST_ROUTES["/api/games/match"] = (GAME_MATCH_MAX_BYTES, store_game_match)
+USER_GET_ROUTES["/api/games/matches"] = list_game_matches
+REMOTE_POST_PATHS.add("/api/games/match")
+REMOTE_GET_PATHS.add("/api/games/matches")
+RESERVED_USER_ACTIONS[GAME_MATCH_ACTION] = "/api/games/match"
+NODE_FEATURES.append("games_match")
+# === end game match hooks ========================================================================
 
 
 class ContinuityIPCHandler(BaseHTTPRequestHandler):
