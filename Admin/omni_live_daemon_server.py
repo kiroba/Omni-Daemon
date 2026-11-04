@@ -102,6 +102,12 @@ Game match results (v8.28.0): POST /api/games/match + GET /api/games/matches on 
 MatchShare.payloadFrom) is stored as a signed game_match chain event: node-signed for a bare summary, or
 the player's own Ed25519 signature when the app sends a signed envelope. Relayed and caught up like other
 events, kept out of /api/events/feed. node-health lists "games_match" in "features".
+Encounters (v8.29.0): opt-in (default off) "StreetPass"-style meetings over the LAN path. Open beacons carry
+a random encounter id rotating every 15 min; same-mesh peers swap a signed display-name card on first meeting
+over POST :5005/p2p/encounter, stored locally only (card, first/last met, count; no IP, location or device
+data), never gossiped or in the feed. Each meeting triggers a rate-limited catch-up with that peer.
+Loopback :5000 /api/encounters (GET, DELETE), /api/encounters/settings (POST), /api/encounters/<id> (DELETE).
+node-health lists "encounters" in "features". See Admin/docs/ENCOUNTERS.md.
 See Admin/docs/GAMES_MATCH.md.
 ==============================================================================
 """
@@ -135,7 +141,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.28.0"
+VERSION = "8.29.0"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -882,6 +888,9 @@ def build_beacon() -> dict:
     """UDP 9101 beacon, signed with this node's Ed25519 key (node_id is the public key)."""
     msg = {"type": "OMNI_P2P_BEACON", "node_id": STATE.node_id, "mesh_id": STATE.mesh_id,
            "ip": LOCAL_IP, "port": P2P_SYNC_PORT, "transport": "UDP_LAN", "ts": now_ms()}
+    enc = encounter_beacon_id()      # v8.29.0: only while encounters are on (random, rotating)
+    if enc:
+        msg["enc"] = enc
     msg["sig"] = STATE.signing_key.sign(_beacon_bytes(msg)).hex()
     return msg
 
@@ -968,6 +977,8 @@ def udp_discovery_broadcaster():
                 payload = json.dumps(build_beacon()).encode('utf-8')
                 sock.sendto(payload, ('<broadcast>', UDP_DISCOVERY_PORT))
                 TELEMETRY.inc("beacons_sent")
+                if OPEN_BEACON_TARGETS:     # v8.29.0: OMNI_OPEN_BEACON_TARGETS (labs, tests, no-broadcast Wi-Fi)
+                    _send_all(sock, payload, OPEN_BEACON_TARGETS, "beacons_sent_unicast")
             if pair_offer_active():
                 targets = quiet_beacon_targets() if quiet else \
                     [('<broadcast>', UDP_DISCOVERY_PORT)] + list(STATE.beacon_extra_targets)
@@ -1015,6 +1026,10 @@ def handle_discovery_packet(msg: dict, peer_ip: str) -> bool:
                                        "signed": "sig" in msg}
     if is_new:
         STATE.catchup_wake.set()   # (re)connected peer: reconcile with it soon
+    try:
+        encounter_on_beacon(msg, peer_ip, peer_port, is_new)   # v8.29.0, no-op while encounters are off
+    except Exception:
+        TELEMETRY.inc("encounter_beacon_errors")
     return True
 
 def udp_discovery_listener():
@@ -5082,6 +5097,452 @@ NODE_FEATURES.append("games_match")
 # === end game match hooks ========================================================================
 
 
+# === Encounters (v8.29.0) ========================================================================
+# "StreetPass"-style encounters over the EXISTING LAN path (UDP beacons + :5005). Opt-in, default OFF.
+#   * While on, every open UDP beacon carries "enc": a random 128-bit id that rotates every
+#     OMNI_ENCOUNTER_ROTATE_S (default 900 s). It is secrets.token_hex, NOT derived from any key, so two
+#     ids can't be linked to each other or to the node. (The beacon still carries node_id: existing
+#     discovery, the trusted-keys allowlist and beacon signatures need it. See Admin/docs/ENCOUNTERS.md.)
+#   * Hearing a same-mesh, accepted beacon with "enc" starts a handshake on the peer's :5005
+#     POST /p2p/encounter. Each side proves its encounter-card key (a separate Ed25519 key, never the
+#     node key). The display-name card travels only to a side that doesn't know us yet (first meeting).
+#   * Stored locally only (~/.omni/encounters.json, owner-only): the card, first/last met (ms), meet count.
+#     No IP, port, location, device model, phone number or contact is stored. Never a chain event, never
+#     gossiped onward, never in /api/events/feed or catch-up.
+#   * Swarm healing: after a handshake, a targeted negentropy catch-up with that peer, at most once per
+#     peer per OMNI_ENCOUNTER_CATCHUP_GAP_S (default 300 s). Feed updates keep flowing through gossip.
+# Loopback API on :5000 (loopback + local token when OMNI_LOCAL_TOKEN=1; never remote hub):
+#   GET /api/encounters, POST /api/encounters/settings, DELETE /api/encounters/<id>, DELETE /api/encounters
+import unicodedata
+
+ENCOUNTER_SCHEMA = 1
+ENCOUNTER_NAME_MAX = 32
+ENCOUNTER_CARD_FIELDS = {"schema", "display_name", "card_pubkey", "ts", "sig"}
+ENCOUNTER_HELLO_FIELDS = {"card_pubkey", "ts", "sig"}
+ENCOUNTER_CARD_DOMAIN = b"OMNI_ENCOUNTER_CARD_V1\n"
+ENCOUNTER_HELLO_DOMAIN = b"OMNI_ENCOUNTER_HELLO_V1\n"
+ENCOUNTER_HELLO_WINDOW_MS = 5 * 60 * 1000
+ENCOUNTER_CARD_FUTURE_MS = 10 * 60 * 1000
+ENCOUNTER_BODY_MAX = 8 * 1024
+ENCOUNTER_MAX_RECORDS = 5000
+ENCOUNTER_ROTATE_S = max(1.0, _env_float("OMNI_ENCOUNTER_ROTATE_S", 900.0))
+ENCOUNTER_CATCHUP_GAP_S = max(0.0, _env_float("OMNI_ENCOUNTER_CATCHUP_GAP_S", 300.0))
+ENCOUNTER_RETRY_S = max(0.5, _env_float("OMNI_ENCOUNTER_RETRY_S", 60.0))
+ENCOUNTER_MEET_GAP_S = max(0.0, _env_float("OMNI_ENCOUNTER_MEET_GAP_S", 1800.0))
+ENCOUNTER_STORE_ENV = "OMNI_ENCOUNTERS_FILE"
+_ENC_ID_RE = re.compile(r"[0-9a-f]{32}")
+_ENC_RECORD_ID_RE = re.compile(r"[0-9a-f]{16}")
+_OPEN_BEACON_TARGETS_ENV = "OMNI_OPEN_BEACON_TARGETS"   # extra unicast targets for OPEN beacons (labs, tests)
+
+
+def open_beacon_targets() -> list:
+    try:
+        return qm.parse_targets(os.environ.get(_OPEN_BEACON_TARGETS_ENV, ""))
+    except ValueError:
+        return []
+
+
+OPEN_BEACON_TARGETS = open_beacon_targets()
+
+
+def sanitize_display_name(value) -> str:
+    """NFC, control/format/private-use chars dropped, whitespace collapsed, 1-32 chars. No email address
+    or phone-number-like text (a display name is the only identifying thing an encounter may carry)."""
+    if not isinstance(value, str):
+        raise ValueError("display_name must be a string")
+    s = unicodedata.normalize("NFC", value)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf", "Co", "Cs", "Cn")
+                or ch in "\t\n\r")
+    s = " ".join(s.split())
+    if not s:
+        raise ValueError("display_name is empty")
+    if len(s) > ENCOUNTER_NAME_MAX:
+        raise ValueError(f"display_name must be at most {ENCOUNTER_NAME_MAX} characters")
+    if "@" in s or sum(ch.isdigit() for ch in s) >= 7:
+        raise ValueError("display_name can't contain an email address or a phone number")
+    return s
+
+
+def encounter_record_id(card_pubkey: str) -> str:
+    return hashlib.sha256(b"omni-encounter-id\n" + card_pubkey.encode("ascii")).hexdigest()[:16]
+
+
+def encounter_card_bytes(card: dict) -> bytes:
+    body = {k: card[k] for k in ("schema", "display_name", "card_pubkey", "ts")}
+    return ENCOUNTER_CARD_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                              ensure_ascii=False).encode("utf-8")
+
+
+def encounter_hello_bytes(card_pubkey: str, mesh: str, ts: int, bind: str) -> bytes:
+    """bind = the server's current beacon enc id (client hello) or the client's card key (server hello),
+    so a captured hello can't be replayed to another node."""
+    return ENCOUNTER_HELLO_DOMAIN + json.dumps({"card_pubkey": card_pubkey, "mesh": mesh, "ts": ts, "bind": bind},
+                                               sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def verify_encounter_card(card, now: int = None) -> dict:
+    """A peer's card, exactly {schema, display_name, card_pubkey, ts, sig}, or ValueError."""
+    if not isinstance(card, dict) or set(card) != ENCOUNTER_CARD_FIELDS:
+        raise ValueError("card must be exactly {schema, display_name, card_pubkey, ts, sig}")
+    if card["schema"] != ENCOUNTER_SCHEMA:
+        raise ValueError("unsupported card schema")
+    pk, ts = card["card_pubkey"], card["ts"]
+    if not isinstance(pk, str) or not _PUBKEY_RE.fullmatch(pk):
+        raise ValueError("card_pubkey must be 64 lowercase hex")
+    if isinstance(ts, bool) or not isinstance(ts, int) or ts <= 0:
+        raise ValueError("card ts must be integer ms")
+    if ts > (now or now_ms()) + ENCOUNTER_CARD_FUTURE_MS:
+        raise ValueError("card ts is in the future")
+    name = card["display_name"]
+    if sanitize_display_name(name) != name:
+        raise ValueError("card display_name is not in sanitized form")
+    if not isinstance(card["sig"], str) or not _ed25519_ok(pk, card["sig"], encounter_card_bytes(card)):
+        raise ValueError("bad card signature")
+    return dict(card)
+
+
+class EncounterStore:
+    """Settings + met cards in one owner-only JSON file. Memory-only: rotating ids, handshake and
+    healing rate limits (those hold peer addresses, which are never written to disk)."""
+
+    def __init__(self, path: Path, key_path: Path):
+        self.path, self.key_path = path, key_path
+        self.lock = threading.RLock()
+        self.enabled, self.display_name, self.records = False, "", {}
+        self._key = None
+        self.enc_id, self.enc_prev, self.enc_at = secrets.token_hex(16), None, time.time()
+        self.attempts = {}     # (host, port) -> last handshake attempt (memory only)
+        self.done = {}         # peer enc id -> handshake finished at (memory only)
+        self.heal_last = {}    # (host, port) -> last targeted catch-up (memory only)
+        self.heal = {"runs": 0, "rate_limited": 0, "last_at": None, "last_stored": 0, "last_pushed": 0,
+                     "last_ok": None}
+        self.handshakes = {"ok": 0, "failed": 0, "cards_received": 0}
+        self._load()
+
+    # -- persistence
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        self.enabled = data.get("enabled") is True
+        try:
+            self.display_name = sanitize_display_name(data.get("display_name") or "")
+        except ValueError:
+            self.display_name, self.enabled = "", False
+        for rec in (data.get("encounters") or []):
+            try:
+                card = verify_encounter_card(rec["card"])
+                rid = encounter_record_id(card["card_pubkey"])
+                self.records[rid] = {"id": rid, "card": card, "first_met": int(rec["first_met"]),
+                                     "last_met": int(rec["last_met"]), "meet_count": max(1, int(rec["meet_count"]))}
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        recs = sorted(self.records.values(), key=lambda r: r["first_met"])
+        data = {"schema": ENCOUNTER_SCHEMA, "enabled": self.enabled, "display_name": self.display_name,
+                "encounters": [{k: r[k] for k in ("card", "first_met", "last_met", "meet_count")} for r in recs]}
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        try:
+            restrict_to_owner(tmp)
+        except Exception:
+            pass
+        os.replace(tmp, self.path)
+
+    # -- own card
+    def key(self):
+        if self._key is None:
+            self._key = load_or_create_key(self.key_path)
+        return self._key
+
+    def pubkey(self) -> str:
+        return pubkey_hex(self.key())
+
+    def my_card(self) -> dict:
+        card = {"schema": ENCOUNTER_SCHEMA, "display_name": self.display_name, "card_pubkey": self.pubkey(),
+                "ts": now_ms()}
+        card["sig"] = self.key().sign(encounter_card_bytes(card)).hex()
+        return card
+
+    def my_hello(self, bind: str) -> dict:
+        ts = now_ms()
+        pk = self.pubkey()
+        return {"card_pubkey": pk, "ts": ts,
+                "sig": self.key().sign(encounter_hello_bytes(pk, STATE.mesh_id, ts, bind)).hex()}
+
+    # -- rotating beacon id
+    def beacon_id(self, now: float = None) -> str:
+        now = time.time() if now is None else now
+        with self.lock:
+            if now - self.enc_at >= ENCOUNTER_ROTATE_S:
+                self.enc_prev, self.enc_id, self.enc_at = self.enc_id, secrets.token_hex(16), now
+            return self.enc_id
+
+    def is_my_beacon_id(self, enc) -> bool:
+        with self.lock:
+            return isinstance(enc, str) and enc in (self.enc_id, self.enc_prev)
+
+    # -- records
+    def knows(self, card_pubkey: str) -> bool:
+        with self.lock:
+            return encounter_record_id(card_pubkey) in self.records
+
+    def met(self, card_pubkey: str, card: dict = None) -> dict:
+        """Record a meeting: a new card (first meeting) or a bump of a known one. Returns the record."""
+        now = now_ms()
+        rid = encounter_record_id(card_pubkey)
+        with self.lock:
+            rec = self.records.get(rid)
+            if rec is None:
+                if card is None:
+                    return None
+                if len(self.records) >= ENCOUNTER_MAX_RECORDS:
+                    oldest = min(self.records.values(), key=lambda r: r["last_met"])
+                    self.records.pop(oldest["id"], None)
+                rec = {"id": rid, "card": card, "first_met": now, "last_met": now, "meet_count": 1}
+                self.records[rid] = rec
+                self.handshakes["cards_received"] += 1
+            else:
+                if card is not None and card["ts"] > rec["card"]["ts"]:
+                    rec["card"] = card              # they renamed themselves
+                if now - rec["last_met"] >= ENCOUNTER_MEET_GAP_S * 1000:
+                    rec["meet_count"] += 1          # a new meeting, not the same one still going on
+                rec["last_met"] = now
+            self._save()
+            return dict(rec)
+
+    def view(self) -> list:
+        with self.lock:
+            recs = sorted(self.records.values(), key=lambda r: -r["last_met"])
+            return [{"id": r["id"], "display_name": r["card"]["display_name"], "card_pubkey": r["card"]["card_pubkey"],
+                     "first_met": r["first_met"], "last_met": r["last_met"], "meet_count": r["meet_count"]}
+                    for r in recs]
+
+    def forget(self, rid: str = None) -> int:
+        with self.lock:
+            if rid is None:
+                n = len(self.records)
+                self.records.clear()
+            else:
+                n = 1 if self.records.pop(rid, None) else 0
+            self.done.clear()
+            self._save()
+            return n
+
+    def settings(self, data) -> tuple:
+        if not isinstance(data, dict) or not data or set(data) - {"enabled", "display_name"}:
+            return {"status": "ERROR", "message": "body must be {\"enabled\": bool, \"display_name\": str}"}, 400
+        with self.lock:
+            name = self.display_name
+            if "display_name" in data:
+                try:
+                    name = sanitize_display_name(data["display_name"])
+                except ValueError as e:
+                    return {"status": "ERROR", "message": str(e)}, 400
+            enabled = self.enabled
+            if "enabled" in data:
+                if not isinstance(data["enabled"], bool):
+                    return {"status": "ERROR", "message": "'enabled' must be true or false"}, 400
+                enabled = data["enabled"]
+            if enabled and not name:
+                return {"status": "ERROR", "message": "set a display_name before turning encounters on"}, 400
+            self.enabled, self.display_name = enabled, name
+            if not enabled:
+                self.done.clear()
+            self._save()
+            return {"status": "OK", "enabled": self.enabled, "display_name": self.display_name}, 200
+
+    def try_start(self, addr: tuple, enc: str, force: bool) -> bool:
+        """Rate-limit handshakes per address; skip a peer enc id we already finished with."""
+        now = time.time()
+        with self.lock:
+            if not force and enc in self.done and now - self.done[enc] < 2 * ENCOUNTER_ROTATE_S + 60:
+                return False
+            if now - self.attempts.get(addr, 0) < ENCOUNTER_RETRY_S:
+                return False
+            self.attempts[addr] = now
+            if len(self.attempts) > 1024:
+                self.attempts = {k: t for k, t in self.attempts.items() if now - t < ENCOUNTER_RETRY_S}
+            return True
+
+    def finished(self, enc: str):
+        now = time.time()
+        with self.lock:
+            self.done[enc] = now
+            if len(self.done) > 4096:
+                self.done = {k: t for k, t in self.done.items() if now - t < 2 * ENCOUNTER_ROTATE_S + 60}
+
+    def heal_allowed(self, addr: tuple) -> bool:
+        now = time.time()
+        with self.lock:
+            if now - self.heal_last.get(addr, -1e18) < ENCOUNTER_CATCHUP_GAP_S:
+                self.heal["rate_limited"] += 1
+                TELEMETRY.inc("encounter_catchup_rate_limited")
+                return False
+            self.heal_last[addr] = now
+            return True
+
+
+def _encounter_paths() -> tuple:
+    override = os.environ.get(ENCOUNTER_STORE_ENV, "").strip()
+    store = Path(override) if override else Path.home() / ".omni" / "encounters.json"
+    return store, store.with_name("encounter_card_ed25519.key")
+
+
+ENCOUNTERS = EncounterStore(*_encounter_paths())
+
+
+def encounter_beacon_id():
+    """The rotating id for the open beacon, or None while encounters are off (nothing new is sent)."""
+    return ENCOUNTERS.beacon_id() if ENCOUNTERS.enabled else None
+
+
+def encounter_heal(host: str, port: int) -> dict:
+    """Swarm healing after an encounter: the existing negentropy catch-up with that one peer,
+    at most once per peer per ENCOUNTER_CATCHUP_GAP_S. Runs under the global catch-up lock."""
+    if not ENCOUNTERS.heal_allowed((host, int(port))):
+        return {"status": "RATE_LIMITED"}
+    if not STATE.catchup_lock.acquire(timeout=60):
+        return {"status": "SKIPPED"}
+    try:
+        stats = reconcile_with_peer(host, int(port))
+    finally:
+        STATE.catchup_lock.release()
+    with ENCOUNTERS.lock:
+        h = ENCOUNTERS.heal
+        h["runs"] += 1
+        h["last_at"] = int(time.time())
+        h["last_stored"], h["last_pushed"] = stats.get("stored", 0), stats.get("pushed", 0)
+        h["last_ok"] = stats.get("error") is None
+    TELEMETRY.inc("encounter_catchup_runs")
+    if stats.get("stored") or stats.get("pushed"):
+        print(f"[✓] Encounter catch-up: stored={stats.get('stored')} pushed={stats.get('pushed')}", flush=True)
+    return dict(stats, status="OK")
+
+
+def encounter_handshake(host: str, port: int, peer_enc: str) -> dict:
+    """Client side. Round 1: hellos (no names). Round 2 only if a card is missing on either side."""
+    hello = ENCOUNTERS.my_hello(peer_enc)
+    code, resp, _ = _peer_post(host, port, "/p2p/encounter", {"schema": ENCOUNTER_SCHEMA, "hello": hello},
+                               timeout=8.0)
+    if code != 200 or not isinstance(resp.get("hello"), dict):
+        raise RuntimeError(f"/p2p/encounter answered {code}")
+    sh = resp["hello"]
+    spk, sts, ssig = str(sh.get("card_pubkey", "")), sh.get("ts"), str(sh.get("sig", ""))
+    if not _PUBKEY_RE.fullmatch(spk) or isinstance(sts, bool) or not isinstance(sts, int) \
+            or abs(now_ms() - sts) > ENCOUNTER_HELLO_WINDOW_MS \
+            or not _ed25519_ok(spk, ssig, encounter_hello_bytes(spk, STATE.mesh_id, sts, hello["card_pubkey"])):
+        raise RuntimeError("bad encounter hello from peer")
+    if spk == hello["card_pubkey"]:
+        raise RuntimeError("that is us")
+    they_need = resp.get("need_card") is True
+    we_need = not ENCOUNTERS.knows(spk)
+    their_card = None
+    if they_need or we_need:
+        body = {"schema": ENCOUNTER_SCHEMA, "hello": ENCOUNTERS.my_hello(peer_enc), "want_card": we_need}
+        if they_need:
+            body["card"] = ENCOUNTERS.my_card()
+        code, resp2, _ = _peer_post(host, port, "/p2p/encounter", body, timeout=8.0)
+        if code != 200:
+            raise RuntimeError(f"/p2p/encounter (cards) answered {code}")
+        if we_need:
+            their_card = verify_encounter_card(resp2.get("card"))
+            if their_card["card_pubkey"] != spk:
+                raise RuntimeError("card key doesn't match the hello")
+    rec = ENCOUNTERS.met(spk, their_card)
+    return {"first": we_need, "record": rec["id"] if rec else None}
+
+
+def _encounter_run(host: str, port: int, enc: str):
+    try:
+        out = encounter_handshake(host, port, enc)
+        ENCOUNTERS.finished(enc)
+        with ENCOUNTERS.lock:
+            ENCOUNTERS.handshakes["ok"] += 1
+        TELEMETRY.inc("encounter_handshakes_ok")
+        if out["first"]:
+            print(f"[✓] Encounter: met someone new (record {out['record']})", flush=True)
+    except Exception:
+        with ENCOUNTERS.lock:
+            ENCOUNTERS.handshakes["failed"] += 1
+        TELEMETRY.inc("encounter_handshakes_failed")
+        return
+    try:
+        encounter_heal(host, port)
+    except Exception as e:
+        print(f"[!] Encounter catch-up failed: {type(e).__name__}", flush=True)
+
+
+def encounter_on_beacon(msg: dict, peer_ip: str, peer_port: int, is_new: bool):
+    """Called for every accepted same-mesh open beacon. Starts a handshake (in a thread) when we are
+    opted in, the peer advertises an encounter id (= it is opted in too), and it's a new id or the peer
+    is back after a gap."""
+    if not ENCOUNTERS.enabled:
+        return
+    enc = msg.get("enc")
+    if not isinstance(enc, str) or not _ENC_ID_RE.fullmatch(enc) or ENCOUNTERS.is_my_beacon_id(enc):
+        return
+    if not ENCOUNTERS.try_start((peer_ip, int(peer_port)), enc, force=is_new):
+        return
+    threading.Thread(target=_encounter_run, args=(peer_ip, int(peer_port), enc), daemon=True).start()
+
+
+def answer_encounter(data, ip: str) -> tuple:
+    """Server side of POST /p2p/encounter (mesh header + known peer already checked)."""
+    if not ENCOUNTERS.enabled:
+        return {"status": "ERROR", "message": "encounters are off on this node"}, 404
+    if not isinstance(data, dict) or data.get("schema") != ENCOUNTER_SCHEMA \
+            or set(data) - {"schema", "hello", "card", "want_card"}:
+        return {"status": "ERROR", "message": "bad encounter request"}, 400
+    h = data.get("hello")
+    if not isinstance(h, dict) or set(h) != ENCOUNTER_HELLO_FIELDS:
+        return {"status": "ERROR", "message": "'hello' must be {card_pubkey, ts, sig}"}, 400
+    cpk, ts, sig = h["card_pubkey"], h["ts"], h["sig"]
+    if not isinstance(cpk, str) or not _PUBKEY_RE.fullmatch(cpk) or isinstance(ts, bool) or not isinstance(ts, int) \
+            or abs(now_ms() - ts) > ENCOUNTER_HELLO_WINDOW_MS or not isinstance(sig, str):
+        return {"status": "ERROR", "message": "bad hello"}, 400
+    with ENCOUNTERS.lock:
+        binds = [b for b in (ENCOUNTERS.enc_id, ENCOUNTERS.enc_prev) if b]
+    if not any(_ed25519_ok(cpk, sig, encounter_hello_bytes(cpk, STATE.mesh_id, ts, b)) for b in binds):
+        TELEMETRY.inc("encounter_hello_rejected")
+        return {"status": "ERROR", "message": "bad hello signature"}, 401
+    if cpk == ENCOUNTERS.pubkey():
+        return {"status": "ERROR", "message": "that is us"}, 400
+    resp = {"status": "OK", "schema": ENCOUNTER_SCHEMA, "hello": ENCOUNTERS.my_hello(cpk)}
+    if "card" in data:
+        try:
+            card = verify_encounter_card(data["card"])
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}, 400
+        if card["card_pubkey"] != cpk:
+            return {"status": "ERROR", "message": "card key doesn't match the hello"}, 400
+        ENCOUNTERS.met(cpk, card)
+    elif ENCOUNTERS.knows(cpk):
+        ENCOUNTERS.met(cpk)
+    resp["need_card"] = not ENCOUNTERS.knows(cpk)
+    if data.get("want_card") is True:
+        resp["card"] = ENCOUNTERS.my_card()     # only to a peer that proved its key and asked
+    return resp, 200
+
+
+def encounters_list() -> dict:
+    with ENCOUNTERS.lock:
+        heal = dict(ENCOUNTERS.heal)
+        hs = dict(ENCOUNTERS.handshakes)
+    items = ENCOUNTERS.view()
+    return {"status": "OK", "enabled": ENCOUNTERS.enabled, "display_name": ENCOUNTERS.display_name,
+            "count": len(items), "encounters": items, "handshakes": hs, "healing": heal}
+
+
+NODE_FEATURES.append("encounters")
+# === end encounters ==============================================================================
+
+
 class ContinuityIPCHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -5158,6 +5619,16 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
                 _deny(self, 403, "loopback only")
                 return
             self._send_json(200, pair_list() if path == "/api/pair/list" else pair_offer_view())
+            return
+        if path == "/api/encounters":
+            # v8.29.0, loopback only (never in REMOTE_GET_PATHS), plus the local token when on.
+            if not _is_loopback(self.client_address[0]):
+                _deny(self, 403, "loopback only")
+                return
+            if query:
+                self._send_json(400, {"status": "ERROR", "message": "no parameters accepted"})
+                return
+            self._send_json(200, encounters_list())
             return
         if path == "/api/sync/peers":
             peers = [{"host": h, "port": p, "transport": v["transport"], "node_hash": v["node_hash"],
@@ -5305,6 +5776,16 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
                 resp, status = pair_remove(data)
             self._send_json(status, resp)
             return
+        if self.path == "/api/encounters/settings":
+            # v8.29.0, loopback only (never in REMOTE_POST_PATHS).
+            if not _is_loopback(self.client_address[0]):
+                _deny(self, 403, "loopback only")
+                return
+            data, ok = self._read_small_json(1024)
+            if ok:
+                resp, status = ENCOUNTERS.settings(data)
+                self._send_json(status, resp)
+            return
         if self.path == "/api/relay/config":
             # Loopback-only (never in REMOTE_POST_PATHS): Omni Node turns the phone relay on/off and caps it.
             if not _is_loopback(self.client_address[0]):
@@ -5404,6 +5885,29 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
                 self.send_error(400, f"Bad Request: {e}")
         else:
             self.send_error(404, "Endpoint Not Found")
+
+    def do_DELETE(self):
+        """v8.29.0: DELETE /api/encounters (forget all) and /api/encounters/<id>. Loopback only; not
+        listed in the CORS preflight answer, so a web page can't send it."""
+        path, _, query = self.path.partition("?")
+        if not remote_gate(self, "DELETE", path):
+            return
+        if not _is_loopback(self.client_address[0]):
+            _deny(self, 403, "loopback only")
+            return
+        if path == "/api/encounters":
+            self._send_json(200, {"status": "OK", "forgotten": ENCOUNTERS.forget()})
+            return
+        if path.startswith("/api/encounters/"):
+            rid = path[len("/api/encounters/"):]
+            if not _ENC_RECORD_ID_RE.fullmatch(rid):
+                self._send_json(400, {"status": "ERROR", "message": "id must be 16 hex characters"})
+                return
+            n = ENCOUNTERS.forget(rid)
+            self._send_json(200 if n else 404, {"status": "OK", "forgotten": n} if n else
+                            {"status": "ERROR", "message": "no such encounter"})
+            return
+        self.send_error(404, "Endpoint Not Found")
 
 class P2PSyncHandler(BaseHTTPRequestHandler):
     _session = None     # set once a request proves a signed session (quiet mode, v8.24.0)
@@ -5595,6 +6099,30 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
                 resp_data, status_code = {"status": "ERROR", "message": f"catch-up failed: {e}"}, 500
             TELEMETRY.inc("catchup_served_reconcile" if self.path == "/p2p/reconcile" else "catchup_served_events")
             self._json_reply(status_code, resp_data)
+            return
+        if self.path == "/p2p/encounter":
+            # v8.29.0. Mesh first (403, unread), then known peers only, small body.
+            their_mesh = self.headers.get(MESH_HEADER)
+            if not self._mesh_ok(their_mesh):
+                self.reject_mesh(their_mesh)
+                return
+            if not self._known_peer(self.client_address[0]):
+                _deny(self, 403, "encounters are only answered for discovered peers on this mesh")
+                return
+            raw = self._read_capped(ENCOUNTER_BODY_MAX)
+            if raw is None:
+                _deny(self, 413, "body missing or too large")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._json_reply(400, {"status": "ERROR", "message": "body must be JSON"})
+                return
+            try:
+                resp, code = answer_encounter(data, self.client_address[0])
+            except Exception as e:
+                resp, code = {"status": "ERROR", "message": f"encounter failed: {type(e).__name__}"}, 500
+            self._json_reply(code, resp)
             return
         if self.path in ("/p2p/hello", "/p2p/dialback", "/p2p/signal/send", "/p2p/signal/poll", "/p2p/relay/cred"):
             self._p2p_v821()
