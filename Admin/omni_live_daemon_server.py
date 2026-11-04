@@ -109,6 +109,13 @@ data), never gossiped or in the feed. Each meeting triggers a rate-limited catch
 Loopback :5000 /api/encounters (GET, DELETE), /api/encounters/settings (POST), /api/encounters/<id> (DELETE).
 node-health lists "encounters" in "features". See Admin/docs/ENCOUNTERS.md.
 See Admin/docs/GAMES_MATCH.md.
+Peer update cache (v8.30.0): Admin/omni_updates.py keeps the newest verified Omniverse update manifest
+(Ed25519 over canonical JSON, key pinned to the release workflow's OMNI_OTA_PUBKEY; no downgrade) and the
+release files it lists, stored by SHA-256 only after the hash matches (~/.omni/updates, LRU under
+OMNI_UPDATE_CACHE_MB). Loopback :5000 GET /api/updates/manifest, /api/updates/file/<sha256> (Range; cache,
+else a paired peer, else GitHub) and /api/updates/status; :5005 GET /p2p/updates/manifest and
+/p2p/updates/file/<sha256> serve the cache only, inside a signed quiet-mesh session. node-health "updates",
+feature "peer_updates". See Admin/docs/PEER_UPDATES.md.
 ==============================================================================
 """
 
@@ -129,6 +136,7 @@ import omni_negentropy as neg
 import omni_wan
 import omni_relay
 import omni_quiet_mesh as qm
+import omni_updates as upd
 import io
 import collections
 import ipaddress
@@ -141,7 +149,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.29.0"
+VERSION = "8.30.0"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -4379,6 +4387,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
                 "quiet": quiet_status(),
                 "features": list(NODE_FEATURES),
+                "updates": updates_health(),
             }
             body = json.dumps(resp_data).encode("utf-8")
             self.send_response(200)
@@ -5096,6 +5105,348 @@ RESERVED_USER_ACTIONS[GAME_MATCH_ACTION] = "/api/games/match"
 NODE_FEATURES.append("games_match")
 # === end game match hooks ========================================================================
 
+# === v8.30.0: peer-to-peer update cache (Admin/omni_updates.py, docs Admin/docs/PEER_UPDATES.md) ===========
+# Loopback :5000 /api/updates/{manifest,file/<sha256>,status}: the newest verified manifest among the cache,
+# paired peers and GitHub, and release files from the cache, else a paired peer, else the manifest's GitHub
+# URL (hash-verified before caching). :5005 /p2p/updates/{manifest,file/<sha256>} serve the cache only, and
+# only inside a signed quiet-mesh session (paired devices); strangers get the usual silence.
+UPDATES_LOCK = threading.Lock()
+_UPDATES = None
+_UPDATES_CFG = None
+UPDATES_RUN = {"last_github": 0.0, "last_peers": 0.0, "sources_tried": [], "last_refresh": None,
+               "config_error": None}
+_UPDATES_REFRESH_LOCK = threading.Lock()
+UPDATE_STREAM_WAIT_S = 40.0      # how long a loopback file request waits for the first byte of a fetch
+
+
+def updates_cfg() -> dict:
+    global _UPDATES_CFG
+    if _UPDATES_CFG is None:
+        try:
+            _UPDATES_CFG = upd.settings()
+        except ValueError as e:
+            print(f"[!] Peer updates off: {e}", flush=True)
+            UPDATES_RUN["config_error"] = str(e)
+            _UPDATES_CFG = {"mode": "off"}
+    return _UPDATES_CFG
+
+
+def updates_cache():
+    """The UpdateCache, created on first use; None when OMNI_UPDATES=off."""
+    global _UPDATES
+    cfg = updates_cfg()
+    if cfg["mode"] == "off":
+        return None
+    with UPDATES_LOCK:
+        if _UPDATES is None:
+            _UPDATES = upd.UpdateCache(cfg["cache_dir"], cfg["cap_bytes"], cfg["pubkey"],
+                                       cfg["allow_unsigned"], cfg["apps"])
+    return _UPDATES
+
+
+def peer_get_open(host: str, port: int, path: str, headers: dict = None, timeout: float = 15.0):
+    """GET on a paired peer's :5005 inside our signed session (quiet mode only). Returns the open
+    http.client response (caller reads and closes it). One fresh handshake if the peer dropped the session."""
+    if not quiet_active():
+        raise PeerUnavailable("update sharing needs a paired device (quiet mesh)")
+    for attempt in (0, 1):
+        s = client_session(host, port, force=attempt == 1)
+        with s["lock"]:
+            s["ctr"] += 1
+            ctr = s["ctr"]
+        hdr = qm.session_header(s["sk"], s["sid"], ctr, "GET", path, b"")
+        conn = http.client.HTTPConnection(str(host).strip("[]"), int(port), timeout=timeout)
+        try:
+            conn.request("GET", path, headers={qm.SESSION_HEADER: hdr, "User-Agent": "omni-daemon-updates/1",
+                                               **(headers or {})})
+            resp = conn.getresponse()
+            resp._omni_conn = conn
+            if s.get("paired"):
+                with STATE.lock:
+                    live = STATE.paired_live.get(s["peer"])
+                    if live:
+                        live["last_seen"] = time.time()
+            return resp
+        except (OSError, http.client.HTTPException):
+            conn.close()
+            with STATE.lock:
+                if STATE.sessions_cli.get((host, int(port))) is s:
+                    STATE.sessions_cli.pop((host, int(port)), None)
+            if attempt == 1:
+                raise
+    raise PeerUnavailable("unreachable")
+
+
+def update_peers() -> list:
+    """Paired devices to ask: where they were last seen live, else their last known address."""
+    return paired_dial_targets() if quiet_active() else []
+
+
+def _peer_manifest(host: str, port: int, timeout: float) -> dict:
+    resp = peer_get_open(host, port, "/p2p/updates/manifest", timeout=timeout)
+    try:
+        if resp.status != 200:
+            raise OSError(f"HTTP {resp.status}")
+        raw = resp.read(upd.MANIFEST_MAX_BYTES + 1)
+    finally:
+        upd._close(resp)
+    return upd.parse_manifest_bytes(raw)
+
+
+def _github_manifest(cfg: dict) -> dict:
+    req = urllib.request.Request(cfg["manifest_url"], headers={"User-Agent": "omni-daemon-updates/1"})
+    with urllib.request.build_opener().open(req, timeout=cfg["timeout_s"]) as r:
+        return upd.parse_manifest_bytes(r.read(upd.MANIFEST_MAX_BYTES + 1))
+
+
+def _offer(cache, m: dict, source: str) -> dict:
+    try:
+        result = cache.offer_manifest(m, source)
+        return {"source": source, "result": result, "build": m.get("build")}
+    except upd.ManifestError as e:
+        TELEMETRY.inc("updates_manifest_rejected")
+        cache.last_error = f"{source}: {e}"
+        return {"source": source, "result": "rejected", "build": m.get("build") if isinstance(m, dict) else None,
+                "detail": str(e)}
+
+
+def updates_refresh(force: bool = False) -> list:
+    """Asks paired peers (every OMNI_UPDATE_PEER_INTERVAL_S) and GitHub (every OMNI_UPDATE_GITHUB_INTERVAL_MIN)
+    for their manifest; the cache keeps the newest one that verifies. Returns what was tried."""
+    cache, cfg = updates_cache(), updates_cfg()
+    if cache is None:
+        return []
+    with _UPDATES_REFRESH_LOCK:
+        tried, now = [], time.time()
+        if force or now - UPDATES_RUN["last_peers"] >= cfg["peer_interval_s"]:
+            UPDATES_RUN["last_peers"] = now
+            results, lock = [], threading.Lock()
+
+            def ask(host, port):
+                src = f"peer {host}:{port}"
+                try:
+                    r = _offer(cache, _peer_manifest(host, port, min(cfg["timeout_s"], 8.0)), src)
+                except upd.ManifestError as e:
+                    r = {"source": src, "result": "rejected", "detail": str(e)}
+                except Exception as e:  # noqa: BLE001
+                    r = {"source": src, "result": "unreachable", "detail": f"{type(e).__name__}: {e}"}
+                with lock:
+                    results.append(r)
+            threads = [threading.Thread(target=ask, args=hp, daemon=True) for hp in update_peers()[:16]]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(12.0)
+            tried.extend(results)
+        if not upd.network_allows_download(cfg["wifi_only"]):
+            tried.append({"source": "github", "result": "skipped (Wi-Fi only)"})
+        elif force or now - UPDATES_RUN["last_github"] >= cfg["github_interval_s"]:
+            UPDATES_RUN["last_github"] = now
+            try:
+                tried.append(_offer(cache, _github_manifest(cfg), "github"))
+            except Exception as e:  # noqa: BLE001
+                cache.last_error = f"github: {type(e).__name__}: {e}"
+                tried.append({"source": "github", "result": "unreachable", "detail": f"{type(e).__name__}: {e}"})
+        else:
+            tried.append({"source": "github", "result": "skipped",
+                          "detail": f"checked {int(now - UPDATES_RUN['last_github'])} s ago"})
+        UPDATES_RUN["sources_tried"] = tried
+        UPDATES_RUN["last_refresh"] = int(now)
+        return tried
+
+
+def update_file_sources(sha: str, cache, cfg: dict, manifest: dict) -> list:
+    """[(name, open_fn)]: paired peers first, then the manifest's GitHub URL."""
+    out = []
+    for host, port in update_peers()[:8]:
+        def open_fn(start, host=host, port=port):
+            return peer_get_open(host, port, f"/p2p/updates/file/{sha}",
+                                 {"Range": f"bytes={start}-"} if start else {}, timeout=cfg["timeout_s"])
+        out.append((f"peer {host}:{port}", open_fn))
+    url = upd.manifest_url_for(manifest, sha)
+    if url and upd.network_allows_download(cfg["wifi_only"]):
+        out.append(("github", upd.url_opener(url, cfg["timeout_s"])))
+    return out
+
+
+def _wait_done(job, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    with job.cond:
+        while not job.done:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            job.cond.wait(min(left, 1.0))
+    return True
+
+
+def serve_update_file(h, sha: str):
+    """Loopback GET /api/updates/file/<sha>: cache, else a paired peer, else GitHub (streamed while it
+    downloads; the bytes are cached only once they hash to sha). Range supported."""
+    cache, cfg = updates_cache(), updates_cfg()
+    rng = h.headers.get("Range")
+    if cache.has(sha):
+        cache.touch(sha)
+        TELEMETRY.inc("updates_file_cache_hits")
+        upd.send_file(h, cache.path_for(sha), rng, extra={"X-Omni-Update-Source": "cache"})
+        return
+    with cache.lock:
+        manifest = cache.manifest
+    if sha not in upd.manifest_hashes(manifest):
+        h._send_json(404, {"status": "ERROR", "message": "not cached and not listed in the current verified manifest"})
+        return
+    sources = update_file_sources(sha, cache, cfg, manifest)
+    if not sources:
+        h._send_json(503, {"status": "ERROR", "message": "no source: no paired peer and GitHub is not allowed now"})
+        return
+    job = cache.job_for(sha, sources)
+    TELEMETRY.inc("updates_file_fetches")
+    if not cache.wait_started(job, UPDATE_STREAM_WAIT_S):
+        h._send_json(504, {"status": "ERROR", "message": "still connecting to a source; try again"})
+        return
+    want = None
+    with job.cond:
+        total, done, ok = job.total, job.done, job.ok
+    if rng:
+        try:
+            want = upd.parse_range(rng, total) if total else "wait"
+        except ValueError:
+            want = "wait"
+        if want == "wait" or (want and want[1] != total - 1):
+            _wait_done(job, 600.0)          # odd range: finish first, then serve it from the cache
+            with job.cond:
+                done, ok = job.done, job.ok
+    if done:
+        if ok and cache.has(sha):
+            upd.send_file(h, cache.path_for(sha), rng, extra={"X-Omni-Update-Source": job.source or "cache"})
+        else:
+            h._send_json(502, {"status": "ERROR", "message": job.error or "download failed", "tried": job.tried})
+        return
+    start = want[0] if isinstance(want, tuple) else 0
+    h.send_response(206 if start else 200)
+    h.send_header("Content-Type", "application/octet-stream")
+    h.send_header("Accept-Ranges", "bytes")
+    h.send_header("X-Omni-Update-Source", job.source or "")
+    h.send_header("Cache-Control", "no-store")
+    if total is not None:
+        h.send_header("Content-Length", str(total - start))
+        if start:
+            h.send_header("Content-Range", f"bytes {start}-{total - 1}/{total}")
+    h.end_headers()
+    h.close_connection = True
+    try:
+        cache.stream_job(job, start, h.wfile.write)
+    except OSError:
+        TELEMETRY.inc("updates_stream_aborted")      # client sees a short body; its own SHA-256 check fails
+
+
+def updates_health() -> dict:
+    cfg = updates_cfg()
+    if cfg["mode"] == "off":
+        return {"enabled": False, "mode": "off", "config_error": UPDATES_RUN["config_error"]}
+    cache = updates_cache()
+    mv = cache.manifest_view()
+    ents = cache.entries()
+    return {"enabled": True, "mode": cfg["mode"], "manifest_build": mv["build"] if mv else None,
+            "manifest_tag": mv["tag"] if mv else None, "manifest_source": mv.get("source") if mv else None,
+            "trust": mv.get("trust") if mv else None, "cache_bytes": sum(e["size"] for e in ents),
+            "cache_files": len(ents), "cap_bytes": cache.cap, "downloads": len(cache.downloads()),
+            "last_error": cache.last_error}
+
+
+def updates_status() -> dict:
+    cfg = updates_cfg()
+    if cfg["mode"] == "off":
+        return {"status": "OK", "enabled": False, "mode": "off", "config_error": UPDATES_RUN["config_error"]}
+    cache = updates_cache()
+    prot = cache.protected()
+    files = sorted(({**e, "apps": prot.get(e["sha256"], [])} for e in cache.entries()),
+                   key=lambda e: -e["last_used"])
+    return {"status": "OK", "enabled": True, "mode": cfg["mode"], "cache_dir": str(cache.root),
+            "cache_bytes": sum(e["size"] for e in files), "cap_bytes": cache.cap, "files": files,
+            "manifest": cache.manifest_view(), "pinned_pubkey": cfg["pubkey"],
+            "allow_unsigned": cfg["allow_unsigned"], "wifi_only": cfg["wifi_only"],
+            "sources_tried": UPDATES_RUN["sources_tried"], "last_refresh": UPDATES_RUN["last_refresh"],
+            "downloads": cache.downloads(), "paired_peers": len(update_peers()), "last_error": cache.last_error}
+
+
+def handle_updates_api(h, path: str, query: str):
+    """Loopback /api/updates/*. remote_gate already ran (local token); these are never remote-hub paths."""
+    if not _is_loopback(h.client_address[0]):
+        _deny(h, 403, "loopback only")
+        return
+    if path == "/api/updates/status":
+        h._send_json(200, updates_status())
+        return
+    cache = updates_cache()
+    if cache is None:
+        h._send_json(409, {"status": "ERROR", "message": "updates are off (OMNI_UPDATES=off)"})
+        return
+    if path == "/api/updates/manifest":
+        params = urllib.parse.parse_qs(query or "")
+        tried = updates_refresh(force=(params.get("refresh") or [""])[-1] in ("1", "true", "yes"))
+        with cache.lock:
+            m, meta = cache.manifest, dict(cache.meta)
+        if m is None:
+            h._send_json(404, {"status": "ERROR", "message": "no verified update manifest yet", "sources_tried": tried})
+            return
+        body = json.dumps(m, indent=2).encode("utf-8")   # exactly the signed manifest: apps can re-verify it
+        h.send_response(200)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Cache-Control", "no-store")
+        h.send_header("X-Omni-Update-Source", str(meta.get("source", "")))
+        h.send_header("X-Omni-Update-Trust", str(meta.get("trust", "")))
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+        return
+    if path.startswith("/api/updates/file/"):
+        sha = path[len("/api/updates/file/"):].lower()
+        if not upd.SHA_RE.fullmatch(sha):
+            h._send_json(400, {"status": "ERROR", "message": "file id must be a 64-hex sha256"})
+            return
+        try:
+            serve_update_file(h, sha)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+    h._send_json(404, {"status": "ERROR", "message": "unknown /api/updates path"})
+
+
+def answer_p2p_update_get(h, path: str):
+    """:5005 GET /p2p/updates/* for a request that already proved a signed session. Cache only:
+    a node never fetches onward for a peer."""
+    cache = updates_cache()
+    if cache is None:
+        h._json_reply(404, {"status": "ERROR", "message": "updates are off"})
+        return
+    if path == "/p2p/updates/manifest":
+        with cache.lock:
+            m = cache.manifest
+        if m is None:
+            h._json_reply(404, {"status": "ERROR", "message": "no manifest"})
+            return
+        TELEMETRY.inc("updates_served_manifest")
+        h._json_reply(200, m)
+        return
+    if path.startswith("/p2p/updates/file/"):
+        sha = path[len("/p2p/updates/file/"):].lower()
+        if not upd.SHA_RE.fullmatch(sha) or not cache.has(sha):
+            h._json_reply(404, {"status": "ERROR", "message": "not in this node's update cache"})
+            return
+        cache.touch(sha)
+        TELEMETRY.inc("updates_served_file")
+        try:
+            upd.send_file(h, cache.path_for(sha), h.headers.get("Range"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+    h._json_reply(404, {"status": "ERROR", "message": "unknown /p2p/updates path"})
+
+
+NODE_FEATURES.append("peer_updates")
+# === end peer update cache =======================================================================
+
 
 # === Encounters (v8.29.0) ========================================================================
 # "StreetPass"-style encounters over the EXISTING LAN path (UDP beacons + :5005). Opt-in, default OFF.
@@ -5613,6 +5964,9 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
         # Loopback: open as before. Non-loopback: remote hub on + bearer token, else 403/401.
         if not remote_gate(self, "GET", path):
             return
+        if path.startswith("/api/updates/"):
+            handle_updates_api(self, path, query)      # v8.30.0, loopback only (+ local token)
+            return
         if path in ("/api/pair/list", "/api/pair/offer"):
             # v8.24.0, loopback only (plus the local token when the node runs with OMNI_LOCAL_TOKEN=1).
             if not _is_loopback(self.client_address[0]):
@@ -5977,6 +6331,26 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
     def handle_one_request(self):
         self._session = None
         super().handle_one_request()
+
+    def do_GET(self):
+        """v8.30.0: GET /p2p/updates/* only, inside a signed session (paired devices). Strangers get the
+        quiet-mode silence; anything else is 404 (silent in quiet mode, like before)."""
+        self._session = None
+        path = self.path.partition("?")[0]
+        if not path.startswith("/p2p/updates/"):
+            self.send_error(404, "Endpoint Not Found")
+            return
+        if not quiet_active():
+            _deny(self, 403, "update sharing is only for paired devices")
+            return
+        sess = verify_session(self.headers.get(qm.SESSION_HEADER), _bare(self.client_address[0]),
+                              "GET", self.path, b"")
+        if sess is None:
+            self._silent()
+            return
+        self._session = sess
+        TELEMETRY.inc("p2p_session_requests")
+        answer_p2p_update_get(self, path)
 
     def do_POST(self):
         self._session = None
