@@ -422,7 +422,10 @@ def manual_session(a: Daemon, b: Daemon):
 
 class UDaemon(Daemon):
     def __init__(self, root, name, env=None):
+        # Every test connection comes from 127.0.0.1, so lift the per-IP :5005 limits (the quiet mesh suite
+        # tests those); a refused connection would look like a stranger's silence.
         base = {"OMNI_NODE_NAME": f"node-{name}", "OMNI_P2P_FAIL_LIMIT": "1000",
+                "OMNI_P2P_RATE_BURST": "1000", "OMNI_P2P_RATE_PER_S": "1000",
                 "OMNI_UPDATE_GITHUB_INTERVAL_MIN": "0", "OMNI_UPDATE_PEER_INTERVAL_S": "0",
                 "OMNI_UPDATE_TIMEOUT_S": "5"}
         base.update(env or {})

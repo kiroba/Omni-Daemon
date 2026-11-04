@@ -49,7 +49,7 @@ class Unit(unittest.TestCase):
 
     def test_version_and_feature(self):
         self.assertEqual(self.m.VERSION, DAEMON_VERSION)
-        self.assertEqual(self.m.VERSION, "8.29.0")
+        self.assertGreaterEqual(tuple(map(int, self.m.VERSION.split("."))), (8, 29, 0))   # encounters arrived in 8.29.0
         self.assertIn("encounters", self.m.NODE_FEATURES)
 
     def test_default_off_and_no_enc_in_beacon(self):
@@ -192,7 +192,7 @@ class TwoDaemonEncounters(unittest.TestCase):
         # --- 1. Default off: peers discover each other, but nothing is exchanged or stored.
         self.assertTrue(_wait(lambda: http(f"{A.tel}/api/v1/telemetry/node-health")[1]["active_peers"] >= 1))
         h = http(f"{A.tel}/api/v1/telemetry/node-health")[1]
-        self.assertEqual(h["version"], "8.29.0")
+        self.assertEqual(h["version"], DAEMON_VERSION)
         self.assertIn("encounters", h["features"])
         time.sleep(4)
         for d in (A, B):
