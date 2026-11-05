@@ -176,6 +176,58 @@ def paired_line(peer: dict) -> str:
     return f"{peer.get('name') or 'Omni node'} {tag}  ·  {where}"
 
 
+# ---- encounters (daemon v8.29.0): StreetPass-style meetings on the same network
+ENC_TITLE = "People you met"
+ENC_HINT = ("When this is on, Omni nodes on the same Wi-Fi that also have it on swap your display name the first "
+            "time you meet, then sync feeds. Nothing else about you is shared. Off by default.")
+ENC_SWITCH = "Meet people nearby"
+ENC_NAME = "Display name"
+ENC_NAME_HOWTO = "1 to 32 characters. No email addresses or phone numbers. Only people you meet in person see it."
+ENC_NAME_EXAMPLE = "Kiro"
+ENC_NAME_FIRST = "Set a display name first."
+ENC_NAME_SAVED = "Display name saved."
+ENC_NONE = "Nobody met yet."
+ENC_FORGET = "Forget"
+ENC_FORGET_ALL = "Forget everyone"
+ENC_FORGET_ALL_CONFIRM = "Forget everyone you've met? If you meet them again while this is on, they come back."
+ENC_FORGOTTEN = "Forgotten."
+ENC_NEEDS_UPDATE = "This node is too old for encounters (needs daemon v8.29.0 or newer)."
+ENC_NETWORK_OFF = "Turn on the network to meet people."
+
+
+def enc_status(enc: dict | None) -> tuple[str, str]:
+    """(text, colour) under the switch, from GET /api/encounters."""
+    if not enc:
+        return "Checking...", TEXT_3
+    if not enc.get("enabled"):
+        return "Off. Your name stays on this device.", TEXT_3
+    n = int(enc.get("count") or 0)
+    name = enc.get("display_name") or ""
+    who = "Nobody met yet" if n == 0 else f"{n} {'person' if n == 1 else 'people'} met"
+    return f"On as {name}  ·  {who}", GREEN
+
+
+def _ago(ms: int, now_ms: int) -> str:
+    s = max(0, (now_ms - int(ms or 0)) // 1000)
+    if s < 120:
+        return "just now"
+    if s < 7200:
+        return f"{s // 60} min ago"
+    if s < 172800:
+        return f"{s // 3600} h ago"
+    return f"{s // 86400} days ago"
+
+
+def encounter_line(e: dict, now_ms: int) -> str:
+    n = int(e.get("meet_count") or 1)
+    times = "met once" if n == 1 else f"met {n} times"
+    return f"{e.get('display_name') or 'Omni friend'}  ·  {times}  ·  last {_ago(e.get('last_met', 0), now_ms)}"
+
+
+def encounter_forget_confirm(name: str) -> str:
+    return f"Forget {name}? Their name leaves this device. If you meet again while this is on, they come back."
+
+
 def quiet_line(quiet: dict | None) -> tuple[str, str]:
     """(text, colour) for the Quiet mode status line, from node-health "quiet"."""
     if not quiet:

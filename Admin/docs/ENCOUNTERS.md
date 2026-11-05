@@ -84,6 +84,8 @@ there is no new feed format.
   that hands peers to the daemon.
 - **Untested on real phones.** Verified with two daemons on one machine over loopback
   (`tests/test_encounters.py`); not on Android, real Wi-Fi, or client-isolating access points.
-- No app UI yet (Omni Node / KickBack need a toggle, a name field and a "people you met" list).
+- App UI: the shared Omni Node core (v8.31.0) has a "People you met" section (switch, display name, list,
+  Forget / Forget everyone) that the desktop shell renders; the Android shell renders it from Omni Node 0.5.4.
+  KickBack has none yet.
 - Not in quiet mode (see the trade-off above).
 - No blocking list: forgetting someone means the card comes back if you meet again while encounters are on.
