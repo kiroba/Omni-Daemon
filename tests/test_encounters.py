@@ -49,7 +49,7 @@ class Unit(unittest.TestCase):
 
     def test_version_and_feature(self):
         self.assertEqual(self.m.VERSION, DAEMON_VERSION)
-        self.assertEqual(self.m.VERSION, "8.29.0")
+        self.assertGreaterEqual(tuple(map(int, self.m.VERSION.split("."))), (8, 29, 0))   # encounters arrived in 8.29.0
         self.assertIn("encounters", self.m.NODE_FEATURES)
 
     def test_default_off_and_no_enc_in_beacon(self):
@@ -192,7 +192,7 @@ class TwoDaemonEncounters(unittest.TestCase):
         # --- 1. Default off: peers discover each other, but nothing is exchanged or stored.
         self.assertTrue(_wait(lambda: http(f"{A.tel}/api/v1/telemetry/node-health")[1]["active_peers"] >= 1))
         h = http(f"{A.tel}/api/v1/telemetry/node-health")[1]
-        self.assertEqual(h["version"], "8.29.0")
+        self.assertEqual(h["version"], DAEMON_VERSION)
         self.assertIn("encounters", h["features"])
         time.sleep(4)
         for d in (A, B):
@@ -231,7 +231,8 @@ class TwoDaemonEncounters(unittest.TestCase):
             feed = B.get("/api/events/feed", {"limit": 200})[1]
             return set(before) <= {e["event_id"] for e in feed["events"]}
         self.assertTrue(_wait(b_has_all), self.enc(B))
-        self.assertGreaterEqual(self.enc(B)["healing"]["runs"], 1)
+        # Live relay can deliver them first; "runs" counts only once the catch-up has finished (slower on Windows).
+        self.assertTrue(_wait(lambda: self.enc(B)["healing"]["runs"] >= 1), self.enc(B))
 
         # --- 5. Ids rotate every 2 s here: more handshakes, but catch-up stays rate-limited (300 s).
         ok0 = self.enc(B)["handshakes"]["ok"]

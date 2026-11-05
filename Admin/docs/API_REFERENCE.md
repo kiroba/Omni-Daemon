@@ -53,6 +53,8 @@ returns. Values are made up.
 | Sync/P2P | POST | `/p2p/reconcile` | 5005 | n/a (mesh + known peer) | [→](#post-p2preconcile) |
 | Sync/P2P | POST | `/p2p/events` | 5005 | n/a (mesh + known peer) | [→](#post-p2pevents) |
 | Sync/P2P | UDP | beacon | 9101 | n/a | [→](#udp-discovery-9101) |
+| Updates (v8.30.0) | GET | `/api/updates/manifest`, `/api/updates/file/<sha256>` (Range), `/api/updates/status` | 5000 | **no**, loopback only (+ local token) | [PEER_UPDATES.md](PEER_UPDATES.md) |
+| Updates (v8.30.0) | GET | `/p2p/updates/manifest`, `/p2p/updates/file/<sha256>` (Range; cache only) | 5005 | paired session only | [PEER_UPDATES.md](PEER_UPDATES.md) |
 
 That is 33 HTTP endpoints (counting `/api/omnimind/telemetry` GET and POST as one) plus the UDP beacon.
 Any other path gets **404** (`send_error`, an HTML body, not JSON). Every port also answers `OPTIONS`
