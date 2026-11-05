@@ -390,6 +390,30 @@ class AgainstARealDaemon(unittest.TestCase):
         self.assertEqual((out["copy"], out["sensitive"], out["toast"]), (self.token, True, W.TOKEN_COPIED))
         self.assertEqual(core.do("token")["howto"], W.TOKEN_HOWTO)
 
+    def test_encounters_section_and_actions(self):
+        core = self.core(DESKTOP)
+        core.refresh()
+        en = core.ui_state()["encounters"]
+        self.assertTrue(en["available"])
+        self.assertFalse(en["on"])
+        self.assertEqual(en["items"], [])
+        out = core.do("encounters", {"on": True})
+        self.assertEqual((out["ok"], out.get("ask_name")), (False, True))
+        self.assertFalse(core.do("encounter_name", {"name": "me@example.com"})["ok"])
+        self.assertTrue(core.do("encounters", {"on": True, "name": "Kiro"})["ok"])
+        core.refresh()
+        en = core.ui_state()["encounters"]
+        self.assertEqual((en["on"], en["name"]), (True, "Kiro"))
+        self.assertTrue(en["line"].startswith("On as Kiro"))
+        self.assertTrue(core.do("encounter_name", {"name": "Kiro B"})["ok"])
+        self.assertFalse(core.do("encounter_forget", {"id": "00" * 8})["ok"])
+        self.assertTrue(core.do("encounters_forget_all")["ok"])
+        self.assertTrue(core.do("encounters", {"on": False})["ok"])
+        core.refresh()
+        self.assertFalse(core.ui_state()["encounters"]["on"])
+        self.assertEqual(W.encounter_line({"display_name": "Ana", "meet_count": 2, "last_met": 0}, 3 * 86400000),
+                         "Ana  ·  met 2 times  ·  last 3 days ago")
+
     def test_check_updates(self):
         core = self.core(DESKTOP)
         out = core.do("check_updates")

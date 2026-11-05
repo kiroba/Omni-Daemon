@@ -149,7 +149,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.30.0"
+VERSION = "8.31.0"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []

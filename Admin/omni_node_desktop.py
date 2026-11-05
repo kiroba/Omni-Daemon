@@ -286,6 +286,21 @@ class NodeWindow:
         self.paired_box = tk.Frame(outer, bg=W.BG)
         self.paired_box.pack(fill="x", pady=(6, 0))
 
+        self._section(outer, w["ENC_TITLE"])
+        self.enc_hint = self._line(outer)
+        self.enc_hint.configure(text=w["ENC_HINT"], fg=W.TEXT_3)
+        self.enc_var = tk.BooleanVar(value=False)
+        erow = tk.Frame(outer, bg=W.BG)
+        erow.pack(fill="x")
+        tk.Checkbutton(erow, text=w["ENC_SWITCH"], variable=self.enc_var, command=self.toggle_encounters,
+                       bg=W.BG, fg=W.TEXT_2, selectcolor=W.CARD, activebackground=W.BG,
+                       activeforeground=W.TEXT).pack(side="left")
+        self._button(erow, w["ENC_NAME"], self.encounter_name_dialog).pack_configure(side="left", padx=(8, 0))
+        self.enc_forget_all = self._button(erow, w["ENC_FORGET_ALL"], self.encounters_forget_all)
+        self.enc_line = self._line(outer)
+        self.enc_box = tk.Frame(outer, bg=W.BG)
+        self.enc_box.pack(fill="x")
+
         self._section(outer, w["UPDATE_TITLE"])
         urow = tk.Frame(outer, bg=W.BG)
         urow.pack(fill="x")
@@ -420,7 +435,8 @@ class NodeWindow:
     # ---- actions: the core decides, this applies the desktop effects
     def act(self, action, args=None, background=None):
         """core.do(action). Actions that talk to the node run off the Tk thread."""
-        slow = action in ("pair_offer", "pair_cancel", "pair_accept", "pair_remove", "check_updates", "internet")
+        slow = action in ("pair_offer", "pair_cancel", "pair_accept", "pair_remove", "check_updates", "internet",
+                          "encounters", "encounter_name", "encounter_forget", "encounters_forget_all")
         if background is None:
             background = slow
         if not background:
@@ -538,6 +554,39 @@ class NodeWindow:
         if messagebox.askyesno(self.w["PAIR_REMOVE"], peer["confirm"], parent=self.root):
             self.act("pair_remove", {"pubkey": peer["pubkey"]})
 
+    def toggle_encounters(self):
+        on = bool(self.enc_var.get())
+        args = {"on": on}
+        if on and not (self.state.get("encounters") or {}).get("name"):
+            name = self._ask_enc_name()
+            if not name:
+                self.enc_var.set(False)
+                return
+            args["name"] = name
+        self.act("encounters", args)
+
+    def _ask_enc_name(self):
+        from tkinter import simpledialog
+        cur = (self.state.get("encounters") or {}).get("name") or ""
+        text = simpledialog.askstring(self.w["ENC_NAME"], self.w["ENC_NAME_HOWTO"], initialvalue=cur,
+                                      parent=self.root)
+        return (text or "").strip()
+
+    def encounter_name_dialog(self):
+        name = self._ask_enc_name()
+        if name:
+            self.act("encounter_name", {"name": name})
+
+    def encounter_forget(self, e: dict):
+        from tkinter import messagebox
+        if messagebox.askyesno(self.w["ENC_FORGET"], e["confirm"], parent=self.root):
+            self.act("encounter_forget", {"id": e["id"]})
+
+    def encounters_forget_all(self):
+        from tkinter import messagebox
+        if messagebox.askyesno(self.w["ENC_FORGET_ALL"], self.w["ENC_FORGET_ALL_CONFIRM"], parent=self.root):
+            self.act("encounters_forget_all")
+
     def open_update(self):
         url = (self.state.get("update") or {}).get("url")
         if url:
@@ -588,6 +637,8 @@ class NodeWindow:
             lab.pack(fill="x")
             lab.bind("<Button-1>", lambda _e, k=p["key"]: self.remove_peer(k))
         self.render_pairing(st["pairing"])
+        if st.get("encounters"):
+            self.render_encounters(st["encounters"])
         u = st["update"]
         self.update_line.configure(text=u["line"], fg=u["color"])
         if u["url"]:
@@ -632,6 +683,30 @@ class NodeWindow:
                           anchor="w").pack(side="left", fill="x", expand=True)
             self.tk.Button(row, text=self.w["PAIR_REMOVE"], command=lambda q=p: self.pair_remove(q), relief="flat",
                            bg=BUTTON_BG, fg=W.TEXT, bd=0, padx=8, pady=2, cursor="hand2").pack(side="right")
+
+    def render_encounters(self, en: dict):
+        self.enc_var.set(bool(en["on"]))
+        self.enc_line.configure(text=en["line"], fg=en["color"])
+        if en["forget_all"]:
+            if not self.enc_forget_all.winfo_manager():
+                self.enc_forget_all.pack(side="left", padx=(8, 0), pady=(8, 2))
+        else:
+            self.enc_forget_all.pack_forget()
+        for child in self.enc_box.winfo_children():
+            child.destroy()
+        if not en["available"]:
+            return
+        if not en["items"]:
+            self.tk.Label(self.enc_box, text=en["none"], bg=W.BG, fg=W.TEXT_3, font=self.font,
+                          anchor="w").pack(fill="x")
+        for e in en["items"]:
+            row = self.tk.Frame(self.enc_box, bg=W.BG)
+            row.pack(fill="x", pady=1)
+            self.tk.Label(row, text=e["line"], bg=W.BG, fg=e["color"], font=self.font,
+                          anchor="w").pack(side="left", fill="x", expand=True)
+            self.tk.Button(row, text=self.w["ENC_FORGET"], command=lambda q=e: self.encounter_forget(q),
+                           relief="flat", bg=BUTTON_BG, fg=W.TEXT, bd=0, padx=8, pady=2,
+                           cursor="hand2").pack(side="right")
 
     def _draw_qr(self, payload: str):
         m = qr_matrix(payload) if payload else None

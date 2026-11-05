@@ -311,7 +311,7 @@ class NodeClient:
         except OSError:
             return None
 
-    def _call(self, url, body=None, timeout=2.0):
+    def _call(self, url, body=None, timeout=2.0, method=None):
         h = {}
         tok = self.token()
         if tok:
@@ -320,7 +320,7 @@ class NodeClient:
         if body is not None:
             data = json.dumps(body).encode()
             h["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=h, method="POST" if data is not None else "GET")
+        req = urllib.request.Request(url, data=data, headers=h, method=method or ("POST" if data is not None else "GET"))
         try:
             with self._opener.open(req, timeout=timeout) as r:
                 return r.status, json.loads(r.read() or b"{}")
@@ -373,6 +373,18 @@ class NodeClient:
 
     def pair_remove(self, pubkey: str):
         return self._call(f"{self.ipc}/api/pair/remove", {"pubkey": pubkey})
+
+    # ---- encounters (daemon v8.29.0, loopback + local token)
+    def encounters(self):
+        return self._call(f"{self.ipc}/api/encounters")
+
+    def encounters_settings(self, **kw):
+        return self._call(f"{self.ipc}/api/encounters/settings", kw)
+
+    def encounter_forget(self, enc_id: str = ""):
+        if enc_id and not re.fullmatch(r"[0-9a-f]{16}", enc_id):
+            return 404, {}
+        return self._call(f"{self.ipc}/api/encounters" + (f"/{enc_id}" if enc_id else ""), method="DELETE")
 
     # ---- updates (public GitHub API, no token)
     def releases(self, timeout: float = 8.0):
@@ -445,6 +457,7 @@ class NodeCore:
         self.health = None
         self.health_err = ""
         self.pairing = None          # GET /api/pair/list
+        self.enc = None              # GET /api/encounters (daemon v8.29.0+)
         self.offer = None            # GET/POST /api/pair/offer while a code shows
         self.peer_state = {}         # peer key -> "ok" / reason (from duties(), here or in another process)
         self.relay_state = {}        # {"active", "reason", "daemon"} from duties()
@@ -480,7 +493,15 @@ class NodeCore:
             return
         health, err = self.client.health()
         pairing, offer, ended = self.pairing, self.offer, None
+        enc = self.enc
         if health is not None:
+            enc = None
+            if "encounters" in (health.get("features") or []):
+                try:
+                    code, body = self.client.encounters()
+                    enc = body if code == 200 else None
+                except (OSError, ValueError):
+                    pass
             try:
                 code, body = self.client.pair_list()
                 pairing = body if code == 200 else None
@@ -495,6 +516,7 @@ class NodeCore:
         with self.lock:
             self.health, self.health_err = health, err
             self.pairing = pairing
+            self.enc = enc
             if self.offer is not None or offer is None:
                 self.offer = offer
         if ended:
@@ -659,6 +681,19 @@ class NodeCore:
                        "confirm": W.pair_remove_confirm(x.get("name") or "this device")}
                       for x in ((self.pairing or {}).get("peers") or []) if on]
 
+            enc_ok = on and "encounters" in ((h or {}).get("features") or [])
+            enc = self.enc if enc_ok else None
+            if not on:
+                e_text, e_color = W.ENC_NETWORK_OFF, W.TEXT_3
+            elif h is not None and not enc_ok:
+                e_text, e_color = W.ENC_NEEDS_UPDATE, W.AMBER
+            else:
+                e_text, e_color = W.enc_status(enc)
+            now_ms = int(time.time() * 1000)
+            met = [{"id": x.get("id", ""), "name": x.get("display_name") or "", "line": W.encounter_line(x, now_ms),
+                    "color": W.TEXT_2, "confirm": W.encounter_forget_confirm(x.get("display_name") or "them")}
+                   for x in ((enc or {}).get("encounters") or [])]
+
             upd = s.get("update") or {}
             if self.update_busy:
                 u_text, u_color = W.UPDATE_CHECKING, W.TEXT_2
@@ -719,6 +754,11 @@ class NodeCore:
                                 "payload": offer.get("payload", ""), "howto": W.PAIR_CODE_HOWTO,
                                 "warning": W.PAIR_TEXT_WARNING},
                             "paired": paired, "none": W.PAIR_NONE},
+                "encounters": {"title": W.ENC_TITLE, "hint": W.ENC_HINT, "available": bool(enc_ok),
+                               "switch": W.ENC_SWITCH, "on": bool((enc or {}).get("enabled")),
+                               "name": (enc or {}).get("display_name") or "", "name_button": W.ENC_NAME,
+                               "line": e_text, "color": e_color, "items": met, "none": W.ENC_NONE,
+                               "forget_all": W.ENC_FORGET_ALL if met else ""},
                 "update": {"title": W.UPDATE_TITLE, "button": W.UPDATE_CHECK, "line": u_text, "color": u_color,
                            "url": upd.get("url", "") if upd.get("newer") else "", "get": W.UPDATE_GET,
                            "newer": bool(upd.get("newer"))},
@@ -888,6 +928,51 @@ class NodeCore:
             return {"ok": False, "toast": W.autostart_failed(str(a["error"]))}
         self.settings.set(start_at_login=bool(a.get("on")))
         return {}
+
+    def _do_encounters(self, a):
+        """{on: bool, name?: str}. Turning on needs a name (given here or saved before)."""
+        if not self.network_on:
+            return {"ok": False, "toast": W.NETWORK_FIRST}
+        body = {"enabled": bool(a.get("on"))}
+        name = str(a.get("name", "")).strip()
+        if name:
+            body["display_name"] = name
+        elif body["enabled"] and not (self.enc or {}).get("display_name"):
+            return {"ok": False, "toast": W.ENC_NAME_FIRST, "ask_name": True}
+        code, out = self.client.encounters_settings(**body)
+        self._reload_encounters()
+        return {"ok": code == 200, "toast": "" if code == 200 else self._enc_msg(code, out)}
+
+    def _do_encounter_name(self, a):
+        if not self.network_on:
+            return {"ok": False, "toast": W.NETWORK_FIRST}
+        code, out = self.client.encounters_settings(display_name=str(a.get("name", "")).strip())
+        self._reload_encounters()
+        return {"ok": code == 200, "toast": W.ENC_NAME_SAVED if code == 200 else self._enc_msg(code, out)}
+
+    def _do_encounter_forget(self, a):
+        code, out = self.client.encounter_forget(str(a.get("id", "")))
+        self._reload_encounters()
+        return {"ok": code == 200, "toast": W.ENC_FORGOTTEN if code == 200 else self._enc_msg(code, out)}
+
+    def _do_encounters_forget_all(self, a):
+        code, out = self.client.encounter_forget("")
+        self._reload_encounters()
+        return {"ok": code == 200, "toast": W.ENC_FORGOTTEN if code == 200 else self._enc_msg(code, out)}
+
+    def _reload_encounters(self):
+        try:
+            code, body = self.client.encounters()
+            if code == 200:
+                self.enc = body
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _enc_msg(code, body) -> str:
+        if code == 404 and not (body or {}).get("message"):
+            return W.ENC_NEEDS_UPDATE
+        return (body or {}).get("message") or (body or {}).get("error") or W.node_answered(code)
 
     def _reload_pairing(self):
         try:
