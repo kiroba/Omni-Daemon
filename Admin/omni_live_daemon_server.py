@@ -4579,6 +4579,61 @@ class _LpeCtx:
 LPE_CTX = _LpeCtx()
 
 
+_FORGET_PUBKEY_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def lpe_forget_author(data) -> tuple:
+    """Operator prune (the "burial"): permanently delete THIS node's stored LPE
+    events for one author pubkey. POST /api/lpe/forget {"pubkey": "<64 hex>"}.
+
+    Why this exists: LPE profiles are replayed from person-signed events, and a
+    retraction would have to be signed by the author's own key — useless when the
+    key is lost or an install is destroyed (a rotated identity leaves an orphaned
+    profile no one can ever sign as again). The node operator is sovereign over
+    their own store, so the prune is a local operator action, not an event.
+
+    Safety rails:
+    - Loopback only in practice: the path is registered in USER_POST_ROUTES but
+      never added to REMOTE_POST_PATHS, so remote_gate refuses non-loopback
+      callers, and on Android the local token is still required.
+    - The target must be a full 64-hex pubkey; the node's own key is refused
+      (quarantine rows are node-authored and never a prune target anyway).
+    - Only this node's rows are deleted. Peers that already hold a copy keep
+      theirs, and a peer can re-offer a pruned event later — a prune is a local
+      burial, not a network-wide retraction.
+    Returns per-action removal counts so the operator can verify the burial.
+    """
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "JSON object body required"}, 400
+    pk = data.get("pubkey")
+    if not isinstance(pk, str) or not _FORGET_PUBKEY_RE.fullmatch(pk):
+        return {"status": "ERROR", "message": "'pubkey' must be a full 64-hex author pubkey"}, 400
+    if pk == STATE.node_id:
+        return {"status": "ERROR", "message": "refusing to prune the node's own key"}, 400
+    db_path = _db_path()
+    if not db_path.exists():
+        return {"status": "OK", "pubkey": pk, "removed": 0, "by_action": {}}, 200
+    marks = ",".join("?" for _ in LPE_ACTIONS)
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    try:
+        rows = conn.execute(
+            f"SELECT action, COUNT(*) FROM events WHERE action IN ({marks}) AND author_pubkey = ? "
+            "GROUP BY action", (*LPE_ACTIONS, pk)).fetchall()
+        by_action = {a: n for a, n in rows if n}
+        removed = sum(by_action.values())
+        if removed:
+            conn.execute(
+                f"DELETE FROM events WHERE action IN ({marks}) AND author_pubkey = ?",
+                (*LPE_ACTIONS, pk))
+            conn.commit()
+    finally:
+        conn.close()
+    if removed:
+        with _LPE_CACHE_LOCK:
+            _LPE_CACHE.update(key=None, events=[])
+    return {"status": "OK", "pubkey": pk, "removed": removed, "by_action": by_action}, 200
+
+
 def _lpe_get(path):
     return lambda h, q: lpe_module().GET_ROUTES[path](LPE_CTX, q)
 
@@ -4595,6 +4650,7 @@ REMOTE_GET_PATHS.update(LPE_GET_PATHS)
 REMOTE_POST_PATHS.update(LPE_REMOTE_POST_PATHS)
 RESERVED_USER_ACTIONS.update(LPE_PERSON_ACTIONS)
 RESERVED_USER_ACTIONS[LPE_NODE_ACTION] = "/api/lpe/quarantine"
+USER_POST_ROUTES["/api/lpe/forget"] = (2 * 1024, lambda h, d: lpe_forget_author(d))   # operator prune: loopback + local token only (never in REMOTE_POST_PATHS)
 # === end LPE hooks ===============================================================================
 
 
