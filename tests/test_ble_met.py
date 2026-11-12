@@ -136,6 +136,17 @@ class BleMetDaemonTests(unittest.TestCase):
         after, _ = self.met_count()
         self.assertEqual(after, before)
 
+    def test_own_introduction_endpoint_signs_correctly(self):
+        code, body, _ = _http(f"{self.d.ipc}/api/ble/introduction")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["node_id"], self.d.node_id)
+        self.assertEqual(body["mesh_id"], self.d.mesh)
+        # the served signature must verify against the daemon's own key - it is
+        # what a peer's daemon will check when the introduction arrives via /api/ble/met
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.d.node_id)).verify(
+            bytes.fromhex(body["sig"]), hello_bytes(body["node_id"], body["mesh_id"], body["ts"]))
+
     def test_sighting_alone_makes_no_met(self):
         before, _ = self.met_count()
         _, pub = make_peer()
