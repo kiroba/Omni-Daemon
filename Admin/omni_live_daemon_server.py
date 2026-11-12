@@ -4102,6 +4102,22 @@ def ble_met_report(data) -> tuple:
           f"{registered} endpoint(s) registered for sync", flush=True)
     return {"status": "OK", "stored": True, "registered": registered, "node_id": node_id}, 200
 
+
+def ble_introduction() -> dict:
+    """GET :5000/api/ble/introduction (loopback): this node's own signed BLE introduction,
+    for the radio layer to serve over GATT. The signature is make_hello()'s
+    (omni.p2p.hello.v1, 5-minute window) - the radio layer re-fetches it on its refresh
+    tick. Endpoints are deliberately absent: the radio layer knows the phone's current
+    addresses better than the daemon does, and endpoints are unsigned dial hints in the
+    met record anyway. The name is the encounters display name when the user set one."""
+    h = make_hello()
+    try:
+        name = ENCOUNTERS.display_name or ""
+    except Exception:
+        name = ""
+    return {"status": "OK", "node_id": h["node_id"], "mesh_id": STATE.mesh_id,
+            "name": name, "ts": h["ts"], "sig": h["sig"]}
+
 def app_checkin(data) -> tuple:
     try:
         c = validate_checkin(data)
@@ -4587,6 +4603,7 @@ USER_GET_ROUTES = {
     "/api/profile": lambda h, q: get_profile(q),
     "/api/profile/list": lambda h, q: list_profiles(q),
     "/api/hub/card": lambda h, q: (hub_card(), 200) if not q else ({"status": "ERROR", "message": "no parameters accepted"}, 400),
+    "/api/ble/introduction": lambda h, q: (ble_introduction(), 200) if not q else ({"status": "ERROR", "message": "no parameters accepted"}, 400),
     "/api/invites/redeem": lambda h, q: invites_redeem(q, h.client_address[0]),
     "/api/social/thread": lambda h, q: social_thread(q),
     "/api/social/counts": lambda h, q: social_counts(q),
