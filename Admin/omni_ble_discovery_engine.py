@@ -30,16 +30,32 @@ code path) - BLE is a phone/edge transport, relays do not need it.
 The registry is in-memory and bounded (MAX_NEARBY), pruned on read past
 NEARBY_TTL_S - consistent with the daemon's no-logs posture: nothing about
 proximity is ever written to disk.
+
+Introductions (v8.33.0): a sighting stays a hint, but a completed GATT
+exchange is more than a sighting - the peer hands over its full public key,
+its mesh and name, its current endpoints, and a signed hello (the
+omni.p2p.hello.v1 bytes). The daemon verifies that signature
+(omni_live_daemon_server.ble_met_report) and only then records the meeting
+in BleMetStore below: full key -> name + endpoints, written to disk
+(~/.omni/ble_met.json, same posture as paired_peers.json) so a meeting
+survives restarts and never expires on the 120 s radio-peer TTL. The stored
+endpoints join the catch-up dial set for MET_DIAL_WINDOW_S after the
+meeting, so when an IP path appears the two nodes sync without anyone
+re-doing the introduction.
 ==============================================================================
 """
 
+import json
 import threading
 import time
+from pathlib import Path
 
 OMNI_BLE_SERVICE_UUID = 0xFFA0          # matches NodeRadio SERVICE_UUID 0000FFA0-...
 KEY_PREFIX_BYTES = 16                   # service-data = first 16 bytes of the node pubkey
 NEARBY_TTL_S = 90.0                     # NodeRadio BLE_FRESH_MS: a sighting stays "nearby" 90 s
 MAX_NEARBY = 256                        # hard bound, oldest evicted first
+MAX_MET = 512                           # hard bound on stored introductions, least-recently-met evicted
+MET_DIAL_WINDOW_S = 24 * 3600.0         # a met node's endpoints join catch-up dials for a day
 _HEX = set("0123456789abcdef")
 
 
@@ -123,6 +139,108 @@ class BleNearbyRegistry:
                 "reports": self.reports,
                 "rejected": self.rejected,
             }
+
+
+class BleMetStore:
+    """Persistent introductions verified over BLE: full node id -> record.
+
+    Records are created ONLY from signature-verified introductions (the
+    verification lives in the daemon server; this class just stores). A
+    record holds the peer's mesh, display name and the endpoints it
+    advertised at the meeting. Unlike radio peers there is no freshness
+    TTL: a meeting is a durable fact, like a pairing. Endpoints are offered
+    as dial targets for MET_DIAL_WINDOW_S after the last meeting - long
+    enough for an IP path to appear, short enough that a stale address is
+    not dialed forever.
+    """
+
+    def __init__(self, path=None, max_entries: int = MAX_MET):
+        self._lock = threading.Lock()
+        self._met: dict[str, dict] = {}
+        self._max = int(max_entries)
+        self._path: Path | None = None
+        self.accepted = 0          # verified introductions recorded since start
+        self.rejected = 0          # refused introductions since start (counted by the server)
+        if path:
+            self.bind(path)
+
+    def bind(self, path):
+        """Attach the on-disk store (called once at daemon startup)."""
+        with self._lock:
+            self._path = Path(path) if path else None
+            self._load_locked()
+
+    def _load_locked(self):
+        if not self._path:
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            rows = raw.get("met") if isinstance(raw, dict) else None
+            for r in rows or []:
+                if isinstance(r, dict) and isinstance(r.get("node_id"), str):
+                    self._met[r["node_id"].lower()] = r
+        except Exception:
+            pass      # a corrupt store must never stop the daemon; meetings re-happen
+
+    def _save_locked(self):
+        if not self._path:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            rows = sorted(self._met.values(), key=lambda r: r.get("last_met", 0))
+            tmp.write_text(json.dumps({"version": 1, "met": rows}, indent=1), encoding="utf-8")
+            tmp.replace(self._path)
+        except Exception:
+            pass
+
+    def record(self, node_id: str, mesh_id: str, name: str, endpoints: list, ts: float = None) -> dict:
+        """Store (or refresh) one verified introduction. Returns the record."""
+        now = time.time() if ts is None else float(ts)
+        nid = str(node_id).lower()
+        with self._lock:
+            old = self._met.get(nid)
+            rec = {"node_id": nid, "mesh_id": mesh_id, "name": name,
+                   "endpoints": list(endpoints),
+                   "first_met": old["first_met"] if old else now,
+                   "last_met": now}
+            self._met[nid] = rec
+            self.accepted += 1
+            if len(self._met) > self._max:      # evict least-recently-met first
+                for k in sorted(self._met, key=lambda k: self._met[k]["last_met"])[: len(self._met) - self._max]:
+                    del self._met[k]
+            self._save_locked()
+            return dict(rec)
+
+    def get(self, node_id: str) -> dict | None:
+        with self._lock:
+            r = self._met.get(str(node_id).lower())
+            return dict(r) if r else None
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._met)
+
+    def dial_targets(self, now: float = None, window_s: float = MET_DIAL_WINDOW_S) -> list:
+        """[(host, port, node_id)] from meetings inside the dial window."""
+        now = time.time() if now is None else now
+        out = []
+        with self._lock:
+            for rec in self._met.values():
+                if now - rec.get("last_met", 0) > window_s:
+                    continue
+                for ep in rec.get("endpoints") or []:
+                    out.append((ep["host"], int(ep["port"]), rec["node_id"]))
+        return out
+
+    def snapshot(self) -> dict:
+        """node-health / telemetry shape: key prefixes only, freshest first."""
+        with self._lock:
+            items = sorted(self._met.values(), key=lambda r: -r.get("last_met", 0))
+            return {"count": len(items),
+                    "prefixes": [key_prefix_hex(r["node_id"]) for r in items[:32]],
+                    "accepted": self.accepted,
+                    "rejected": self.rejected}
 
 
 if __name__ == "__main__":

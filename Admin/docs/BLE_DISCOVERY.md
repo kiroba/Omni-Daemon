@@ -47,17 +47,48 @@ report/refusal counters); the summary's `capabilities.ble_discovery` state is
   the beacon prefixes the summary already prints. Nothing about proximity is
   written to disk (in-memory, pruned on read), per the no-logs posture.
 
+## Introductions: the BLE-met record (v8.33.0)
+
+A completed GATT exchange is more than a sighting. The peer hands over an
+**introduction**: its full public key, mesh, display name, current endpoints,
+and a signature over the `omni.p2p.hello.v1` bytes (`hello_bytes(node_id,
+mesh_id, ts)` — no new crypto format). The radio layer hands it to
+`POST :5000/api/ble/met` (loopback + local token). The daemon verifies the
+signature, the mesh and the allowlist (same checks as `/p2p/hello`), and only
+then:
+
+- stores the meeting in `~/.omni/ble_met.json` — persistent across restarts,
+  **not** on the 120 s radio-peer TTL (a meeting is a durable fact, like a
+  pairing; this is the one BLE artifact written to disk, and it holds only
+  what the peer signed an introduction for: public key, name, endpoints);
+- registers every dialable endpoint at once via the radio-peer path
+  (transport `ble`), so catch-up syncs on the next wake; and re-registers
+  them at startup;
+- keeps the stored endpoints in the catch-up dial set for 24 h after the
+  meeting, so when an IP path appears later the two nodes sync without
+  re-doing the introduction.
+
+The signature covers the identity (node_id / mesh / ts, 5-minute window),
+not the endpoints: endpoints stay dial hints, and the sync they trigger is
+itself signature-gated end to end. Node-health's `ble` block gains a `met`
+summary (count + key prefixes); the telemetry `ble_discovery` counts gain
+`met` / `met_accepted`.
+
 ## Tests
 
 `tests/test_ble_discovery.py` — wire format vs NodeRadio, own/junk refusal,
 expiry and bounds, plus a live-daemon pass: report → node-health → summary,
 asserting `active_peers` stays 0 for a sighting.
 
+`tests/test_ble_met.py` — the met store (persistence, dial window, bounds)
+plus a live-daemon pass: a verified introduction registers a peer and
+persists; a bad signature, a wrong mesh and a stale hello do not.
+
 ## Not here
 
 - The desktop daemon has no BLE stack and no server path; its registry simply
-  stays empty. BLE is a phone/edge transport.
-- NodeRadio does not yet POST sightings to this endpoint (it keeps its own
-  `radio_status.json` count for the node screen). Wiring that one call in the
-  app is a small follow-up; the daemon side is complete and app-agnostic —
-  any reporter with the local token can feed it.
+  stays empty. BLE is a phone/edge transport. (The met endpoint exists there
+  too, but nothing reports to it without a radio layer.)
+- NodeRadio reports sightings to `/api/ble/nearby` since Omni-Node-Daemon
+  PR #14. The GATT introduction exchange itself (connectable advertising +
+  reading the peer's introduction blob) is the remaining app-side piece.
