@@ -24,6 +24,7 @@ from SQLite and cached for 5 s (`OMNI_TELEMETRY_CACHE_S`, max 60; tests use 0).
 | `finance` | `state`, `integrity`, `entries`, `accounts`, `welcome_grants`, `total_issued`, `total_transferred`, `fees_collected`, `entries_by_kind`, `treasury_fee_bps`, `test_only` | replay of the TEST credits ledger (hash + signature re-checked, like `/api/credits/*`) |
 | `users` | `identities_seen`, `active_24h`, `active_7d`, `new_7d`, `bug_reports`, `basis` | distinct signing pubkeys in stored events (author, or `payload.app_author_pubkey` for local app posts), this node excluded; activity by signed event time |
 | `services` | `daemon_version`, `uptime_seconds`, `node_id_prefix`, `mesh_id`, `event_store` (`total_events`, `db_bytes`, `last_event_ago_s`, `events_by_action` top 20), `omnimind_agent` | process + SQLite |
+| `capabilities` | per-area `{state, detail}` for everything no counter feeds (see below) | static, from the daemon's own wiring |
 
 Protocol ids: `tcp_api` (:9100/:5000, listen hosts, remote hub on/off), `p2p_sync` (:5005 `/p2p/sync`,
 peer events stored, relay ok/failed, mesh rejects), `udp_discovery` (:9101 listener state, beacons
@@ -31,15 +32,27 @@ sent/accepted/rejected, active peers + pubkey prefixes), `negentropy` (last catc
 static peers, reconcile requests served; `idle` until a run happens), `signaling` (mailbox queued /
 recipients, sends ok/rejected, polls, deliveries), `turn` (`configured` yes/no only).
 
-## Not reported (nothing in the daemon produces it yet)
+## Capability states (`capabilities`, v8.32.0)
+
+Areas no live counter feeds are reported as a `capabilities` block so the Mesh Monitor renders
+the daemon's own statement instead of hardcoded app-side text. Each entry is
+`{state, detail}` (+ `module` where one exists); states are `not_wired` (code or a feed is
+missing), `parked` (deliberately off behind a product gate) and `wired`.
 
 - ~~Consent~~, app versions, crash counts: reported since v8.16.0 when apps send signed check-ins
   (`users.app_checkins`, `services.app_crashes`; see `APP_TELEMETRY.md`). Until the apps send them
   these read 0.
-- Subscriptions, cash payments, payouts: not built. Credits are test-only and closed-loop.
-- GossipSub, BLE discovery, NAT hole punching, WebRTC media: modules exist under `Admin/` but are not
-  wired into this daemon, so they have no telemetry.
-- Hardware attestation: not built.
+- `subscriptions`, `cash_payments`: `parked` - fiat waits for the payments system and legal
+  review; credits are test-only and closed-loop, nothing is redeemable.
+- `gossipsub`, `nat_hole_punching`, `call_media_stats`: `not_wired` - modules exist under
+  `Admin/` but are not run by the live daemon (or, for call media, no app feed exists yet),
+  so they have no telemetry beyond this statement.
+- `ble_discovery`: `wired` since v8.32.0 - also a `ble_discovery` protocol entry below and a
+  `ble` block in node-health; see `BLE_DISCOVERY.md`.
+- `hardware_attestation`: `not_wired` - not built.
+- `store_encryption`: `not_wired` - events sit in plain SQLite (WAL); at-rest encryption is
+  planned at the app layer (AES-GCM via the already-required `cryptography` library), not via
+  the SQLCipher native dependency.
 
 ## What is and isn't verified (v8.12.0)
 

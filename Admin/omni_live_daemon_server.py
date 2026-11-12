@@ -136,6 +136,11 @@ import omni_negentropy as neg
 import omni_wan
 import omni_relay
 import omni_quiet_mesh as qm
+import omni_ble_discovery_engine as ble_engine
+
+# BLE proximity sightings (v8.32.0): reported by the node radio layer to
+# POST /api/ble/nearby, kept in memory only. Hints, never peers.
+BLE_NEARBY = ble_engine.BleNearbyRegistry()
 import omni_updates as upd
 import io
 import collections
@@ -149,7 +154,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.31.0"
+VERSION = "8.32.0"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -216,7 +221,7 @@ REMOTE_GET_PATHS = {"/api/events/feed", "/api/events/stats", "/api/events/list",
 REMOTE_POST_PATHS = {"/api/events/append", "/api/bugs/report", "/api/signal/send",
                      "/api/profile/update", "/api/contacts/verify", "/api/invites/create",
                      "/api/social/comment", "/api/social/react", "/api/credits/send",
-                     "/api/telemetry/app-checkin", "/api/profile/social-import"}
+                     "/api/telemetry/app-checkin", "/api/ble/nearby", "/api/profile/social-import"}
 _APP_ENVELOPE_KEYS = ("app_event_id", "app_author_pubkey", "app_signature", "app_previous_hash",
                       "app_ts", "app_timestamp")
 
@@ -4010,6 +4015,20 @@ def _checkins_db():
     return conn
 
 
+def ble_nearby_report(data) -> tuple:
+    """POST :5000/api/ble/nearby (loopback + local token): the node's radio layer
+    reports the BLE key prefixes it heard on service 0xFFA0. A sighting is a hint
+    only - it never creates a peer and is never written to disk.
+    Body: {"seen": ["<32 hex>", ...]} (at most 64 per report)."""
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    seen = data.get("seen")
+    if not isinstance(seen, list) or len(seen) > 64:
+        return {"status": "ERROR", "message": "'seen' must be a list of at most 64 key prefixes"}, 400
+    kept = sum(1 for pre in seen if BLE_NEARBY.note(pre))
+    TELEMETRY.inc("ble_sightings_reported", kept)
+    return {"status": "OK", "kept": kept, "nearby": BLE_NEARBY.snapshot()["nearby"]}, 200
+
 def app_checkin(data) -> tuple:
     try:
         c = validate_checkin(data)
@@ -4150,6 +4169,10 @@ def build_telemetry_summary() -> dict:
          "counts": {"sent": c("beacons_sent"), "accepted": c("beacons_accepted"),
                     "rejected_signature": c("beacons_rejected_signature"),
                     "rejected_mesh": c("beacons_rejected_mesh")}},
+        {"id": "ble_discovery", "name": "BLE discovery (0xFFA0, proximity only)",
+         "state": "up", "detail": "sightings reported by the node radio layer; hints only, never peers",
+         "last_seen_ago_s": BLE_NEARBY.snapshot()["last_seen_ago_s"], "nearby": BLE_NEARBY.snapshot()["nearby"],
+         "counts": {"reports": BLE_NEARBY.snapshot()["reports"], "rejected": BLE_NEARBY.snapshot()["rejected"]}},
         {"id": "negentropy", "name": "Catch-up sync (negentropy v1)",
          "state": "idle" if catchup is None else ("degraded" if catchup["errors"] else "up"),
          "static_peers": len(STATE.sync_peers), "interval_s": _env_float(CATCHUP_INTERVAL_ENV, 60.0),
@@ -4223,11 +4246,47 @@ def build_telemetry_summary() -> dict:
         "omnimind_agent": {"live": omnimind_age is not None and omnimind_age < OMNIMIND_STALE_SECONDS,
                            "last_report_ago_s": None if omnimind_age is None else round(omnimind_age, 1)},
     }
+    # Capability states (v8.32.0): every area the Mesh Monitor shows that no
+    # live counter feeds. The daemon reports its own state honestly - module
+    # present but not run, parked behind a product/legal gate, or genuinely
+    # fed elsewhere - so the monitor renders facts, not app-side guesses.
+    capabilities = {
+        "gossipsub": {"state": "not_wired", "module": "Admin/omni_gossipsub_swarm_router.py",
+                      "detail": "module present in the daemon tree but not run by the live server; "
+                                "events relay over HTTP /p2p/sync"},
+        "ble_discovery": {"state": "wired", "module": "Admin/omni_ble_discovery_engine.py",
+                          "detail": "the node radio layer reports 0xFFA0 key-prefix sightings to "
+                                    "POST /api/ble/nearby; node-health 'ble' shows who is near. "
+                                    "Proximity only: sightings never create peers"},
+        "nat_hole_punching": {"state": "not_wired", "module": "Admin/omni_ice_cgnat_hole_puncher.py",
+                              "detail": "module present but not wired in; nodes behind NAT meet "
+                                        "through a reachable relay peer instead"},
+        "call_media_stats": {"state": "not_wired",
+                             "detail": "only the signaling mailbox is live; a call-media stats "
+                                       "feed from the apps would fill this"},
+        "hardware_attestation": {"state": "not_wired",
+                                 "detail": "no device attestation check (e.g. Android key "
+                                           "attestation) is verified by this hub yet"},
+        "store_encryption": {"state": "not_wired",
+                             "detail": "events are stored in plain SQLite (WAL); at-rest "
+                                       "encryption is planned at the app layer (AES-GCM via the "
+                                       "already-required cryptography library), no SQLCipher "
+                                       "native dependency"},
+        "subscriptions": {"state": "parked",
+                          "detail": "no subscription billing; fiat features wait for the payments "
+                                    "system and legal review (source of truth section 11)"},
+        "in_app_credit_transfers": {"state": "not_wired",
+                                    "detail": "the hub has a loopback-only /api/credits/transfer, "
+                                              "but no app calls it yet"},
+        "cash_payments": {"state": "parked",
+                          "detail": "credits are closed-loop TEST credits with no cash value; "
+                                    "nothing is redeemable until the payments and legal gate opens"},
+    }
     return {"status": "OK", "schema": TELEMETRY_SCHEMA, "version": VERSION, "generated_at_ms": now_ms(),
             "counters_since_ms": int(STATE.start_time * 1000),
             "counters_note": "since-start counters are in memory and reset when the daemon restarts",
             "protocols": protocols, "security": security, "finance": _finance_summary(),
-            "users": users, "services": services}
+            "users": users, "services": services, "capabilities": capabilities}
 
 class BodyError(Exception):
     def __init__(self, status: int, message: str):
@@ -4382,6 +4441,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "catchup": STATE.last_catchup,
                 "wan": WAN.snapshot() if WAN else None,
+                "ble": BLE_NEARBY.snapshot(),
                 "relay": relay_status() if RELAY is not None else {"enabled": False},
                 "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
@@ -4466,6 +4526,7 @@ USER_POST_ROUTES = {
     "/api/profile/social-import": (SOCIAL_IMPORT_MAX_BYTES, lambda h, d: store_user_event(
         d, {SOCIAL_IMPORT_ACTION: validate_social_import}, _via(h))),
     "/api/telemetry/app-checkin": (4 * 1024, lambda h, d: app_checkin(d)),
+    "/api/ble/nearby": (4 * 1024, lambda h, d: ble_nearby_report(d)),
 }
 
 
@@ -5947,6 +6008,7 @@ def encounters_list() -> dict:
 
 
 NODE_FEATURES.append("encounters")
+NODE_FEATURES.append("ble_discovery")
 # === end encounters ==============================================================================
 
 
@@ -6644,6 +6706,7 @@ def main():
     print(f"[✓] Event time format: {'legacy float timestamp' if LEGACY_FLOAT_TS else 'int-ms ts'} for events this node stamps")
     print("------------------------------------------------------------------", flush=True)  # show in daemon.log now
 
+    BLE_NEARBY.set_own(STATE.node_id)
     t1 = threading.Thread(target=udp_discovery_broadcaster, daemon=True)
     t2 = threading.Thread(target=udp_discovery_listener, daemon=True)
     t3 = threading.Thread(target=catchup_loop, daemon=True)
