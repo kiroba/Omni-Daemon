@@ -136,6 +136,15 @@ import omni_negentropy as neg
 import omni_wan
 import omni_relay
 import omni_quiet_mesh as qm
+import omni_ble_discovery_engine as ble_engine
+
+# BLE proximity sightings (v8.32.0): reported by the node radio layer to
+# POST /api/ble/nearby, kept in memory only. Hints, never peers.
+BLE_NEARBY = ble_engine.BleNearbyRegistry()
+# BLE introductions (v8.33.0): full-key, signature-verified meetings handed in
+# via POST /api/ble/met after a GATT exchange. Persistent (ble_met_path()),
+# never on the radio-peer TTL. Bound to its file at startup.
+BLE_MET = ble_engine.BleMetStore()
 import omni_updates as upd
 import io
 import collections
@@ -149,7 +158,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.31.0"
+VERSION = "8.33.0"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -216,7 +225,7 @@ REMOTE_GET_PATHS = {"/api/events/feed", "/api/events/stats", "/api/events/list",
 REMOTE_POST_PATHS = {"/api/events/append", "/api/bugs/report", "/api/signal/send",
                      "/api/profile/update", "/api/contacts/verify", "/api/invites/create",
                      "/api/social/comment", "/api/social/react", "/api/credits/send",
-                     "/api/telemetry/app-checkin", "/api/profile/social-import"}
+                     "/api/telemetry/app-checkin", "/api/ble/nearby", "/api/ble/met", "/api/profile/social-import"}
 _APP_ENVELOPE_KEYS = ("app_event_id", "app_author_pubkey", "app_signature", "app_previous_hash",
                       "app_ts", "app_timestamp")
 
@@ -227,6 +236,7 @@ _APP_ENVELOPE_KEYS = ("app_event_id", "app_author_pubkey", "app_signature", "app
 # P2P :5005 is unchanged (mesh header + signatures).
 LOCAL_TOKEN_ENV = "OMNI_LOCAL_TOKEN"
 LOCAL_TOKEN_FILE_ENV = "OMNI_LOCAL_TOKEN_FILE"
+BLE_MET_FILE_ENV = "OMNI_BLE_MET_FILE"
 LOCAL_TOKEN_HEADER = "X-Omni-Local-Token"
 LOCAL_TOKEN_REQUIRED = os.environ.get(LOCAL_TOKEN_ENV, "").strip().lower() in ("1", "true", "yes")
 
@@ -363,6 +373,11 @@ def local_token_path() -> Path:
 def paired_store_path() -> Path:
     override = os.environ.get(qm.STORE_ENV, "").strip()
     return Path(override) if override else Path.home() / ".omni" / "paired_peers.json"
+
+
+def ble_met_path() -> Path:
+    override = os.environ.get(BLE_MET_FILE_ENV, "").strip()
+    return Path(override) if override else Path.home() / ".omni" / "ble_met.json"
 
 def load_or_create_local_token(path: Path = None) -> str:
     """Same storage rules as the remote-hub token, separate file (a leaked hub token must not unlock
@@ -2954,6 +2969,9 @@ def catchup_peers() -> list:
         for host, port in paired_dial_targets():      # v8.24.0: paired devices (signed session)
             if (host, port) not in peers:
                 peers.append((host, port))
+    for host, port, _ in BLE_MET.dial_targets():      # v8.33.0: nodes met over BLE (verified introduction)
+        if (host, port) not in peers:
+            peers.append((host, port))
     return peers
 
 def _resolve(host: str) -> set:
@@ -4010,6 +4028,80 @@ def _checkins_db():
     return conn
 
 
+def ble_nearby_report(data) -> tuple:
+    """POST :5000/api/ble/nearby (loopback + local token): the node's radio layer
+    reports the BLE key prefixes it heard on service 0xFFA0. A sighting is a hint
+    only - it never creates a peer and is never written to disk.
+    Body: {"seen": ["<32 hex>", ...]} (at most 64 per report)."""
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    seen = data.get("seen")
+    if not isinstance(seen, list) or len(seen) > 64:
+        return {"status": "ERROR", "message": "'seen' must be a list of at most 64 key prefixes"}, 400
+    kept = sum(1 for pre in seen if BLE_NEARBY.note(pre))
+    TELEMETRY.inc("ble_sightings_reported", kept)
+    return {"status": "OK", "kept": kept, "nearby": BLE_NEARBY.snapshot()["nearby"]}, 200
+
+
+def ble_met_report(data) -> tuple:
+    """POST :5000/api/ble/met (loopback + local token): the node's radio layer hands in a
+    full introduction it received over a BLE GATT exchange. Body:
+    {"node_id", "mesh_id", "name", "endpoints": [{"host", "port"}], "ts", "sig"} where sig
+    is the peer's Ed25519 signature over hello_bytes(node_id, mesh_id, ts) - the
+    omni.p2p.hello.v1 bytes, so no new crypto format. A verified introduction is stored
+    persistently (BLE_MET) and every dialable endpoint is registered at once through the
+    radio-peer path, so catch-up syncs with it on the next wake; the stored record's
+    endpoints also join the catch-up dial set for a day after the meeting. Note the
+    signature covers the identity (node_id/mesh/ts), not the endpoints: endpoints stay
+    dial hints, and the sync they trigger is itself signature-gated end to end.
+    """
+    if not isinstance(data, dict):
+        return {"status": "ERROR", "message": "body must be a JSON object"}, 400
+    node_id = str(data.get("node_id", "")).strip().lower()
+    if len(node_id) != 64 or any(c not in "0123456789abcdef" for c in node_id):
+        return {"status": "ERROR", "message": "node_id must be the full 64-hex public key"}, 400
+    if node_id == STATE.node_id:
+        return {"status": "ERROR", "message": "that is this node"}, 400
+    mesh_id = str(data.get("mesh_id", ""))
+    ts = data.get("ts")
+    if not isinstance(ts, int) or isinstance(ts, bool) or abs(now_ms() - ts) > HELLO_WINDOW_MS:
+        return {"status": "ERROR", "message": "'ts' missing or outside the 5 minute window"}, 400
+    if not _ed25519_ok(node_id, str(data.get("sig", "")), hello_bytes(node_id, mesh_id, ts)):
+        BLE_MET.rejected += 1
+        TELEMETRY.inc("ble_met_rejected")
+        return {"status": "ERROR", "message": "bad introduction signature"}, 401
+    if mesh_id != STATE.mesh_id:
+        BLE_MET.rejected += 1
+        return {"status": "ERROR", "message": "introduction is for a different mesh"}, 403
+    if not is_trusted(node_id, STATE.trusted_keys):
+        BLE_MET.rejected += 1
+        return {"status": "ERROR", "message": "node key not on this mesh's allowlist"}, 403
+    endpoints = []
+    raw_eps = data.get("endpoints")
+    if isinstance(raw_eps, list):
+        for ep in raw_eps[:4]:
+            if not isinstance(ep, dict):
+                continue
+            host = str(ep.get("host") or "").strip().strip("[]")
+            try:
+                port = int(ep.get("port") or P2P_SYNC_PORT)
+            except (TypeError, ValueError):
+                continue
+            if host and _RADIO_HOST_RE.fullmatch(host) and 0 < port < 65536:
+                endpoints.append({"host": host, "port": port})
+    name = str(data.get("name") or "")[:64]
+    BLE_MET.record(node_id, mesh_id, name, endpoints)
+    registered = 0
+    for ep in endpoints:
+        _, code = add_radio_peer({"host": ep["host"], "port": ep["port"],
+                                  "transport": "ble", "node_hash": node_id})
+        if code == 200:
+            registered += 1
+    TELEMETRY.inc("ble_met_accepted")
+    print(f"[✓] BLE introduction: met {name or node_id[:8]} ({node_id[:8]}), "
+          f"{registered} endpoint(s) registered for sync", flush=True)
+    return {"status": "OK", "stored": True, "registered": registered, "node_id": node_id}, 200
+
 def app_checkin(data) -> tuple:
     try:
         c = validate_checkin(data)
@@ -4150,6 +4242,11 @@ def build_telemetry_summary() -> dict:
          "counts": {"sent": c("beacons_sent"), "accepted": c("beacons_accepted"),
                     "rejected_signature": c("beacons_rejected_signature"),
                     "rejected_mesh": c("beacons_rejected_mesh")}},
+        {"id": "ble_discovery", "name": "BLE discovery (0xFFA0, proximity only)",
+         "state": "up", "detail": "sightings reported by the node radio layer; hints only, never peers",
+         "last_seen_ago_s": BLE_NEARBY.snapshot()["last_seen_ago_s"], "nearby": BLE_NEARBY.snapshot()["nearby"],
+         "counts": {"reports": BLE_NEARBY.snapshot()["reports"], "rejected": BLE_NEARBY.snapshot()["rejected"],
+                    "met": BLE_MET.count(), "met_accepted": BLE_MET.snapshot()["accepted"]}},
         {"id": "negentropy", "name": "Catch-up sync (negentropy v1)",
          "state": "idle" if catchup is None else ("degraded" if catchup["errors"] else "up"),
          "static_peers": len(STATE.sync_peers), "interval_s": _env_float(CATCHUP_INTERVAL_ENV, 60.0),
@@ -4223,11 +4320,47 @@ def build_telemetry_summary() -> dict:
         "omnimind_agent": {"live": omnimind_age is not None and omnimind_age < OMNIMIND_STALE_SECONDS,
                            "last_report_ago_s": None if omnimind_age is None else round(omnimind_age, 1)},
     }
+    # Capability states (v8.32.0): every area the Mesh Monitor shows that no
+    # live counter feeds. The daemon reports its own state honestly - module
+    # present but not run, parked behind a product/legal gate, or genuinely
+    # fed elsewhere - so the monitor renders facts, not app-side guesses.
+    capabilities = {
+        "gossipsub": {"state": "not_wired", "module": "Admin/omni_gossipsub_swarm_router.py",
+                      "detail": "module present in the daemon tree but not run by the live server; "
+                                "events relay over HTTP /p2p/sync"},
+        "ble_discovery": {"state": "wired", "module": "Admin/omni_ble_discovery_engine.py",
+                          "detail": "the node radio layer reports 0xFFA0 key-prefix sightings to "
+                                    "POST /api/ble/nearby; node-health 'ble' shows who is near. "
+                                    "Proximity only: sightings never create peers"},
+        "nat_hole_punching": {"state": "not_wired", "module": "Admin/omni_ice_cgnat_hole_puncher.py",
+                              "detail": "module present but not wired in; nodes behind NAT meet "
+                                        "through a reachable relay peer instead"},
+        "call_media_stats": {"state": "not_wired",
+                             "detail": "only the signaling mailbox is live; a call-media stats "
+                                       "feed from the apps would fill this"},
+        "hardware_attestation": {"state": "not_wired",
+                                 "detail": "no device attestation check (e.g. Android key "
+                                           "attestation) is verified by this hub yet"},
+        "store_encryption": {"state": "not_wired",
+                             "detail": "events are stored in plain SQLite (WAL); at-rest "
+                                       "encryption is planned at the app layer (AES-GCM via the "
+                                       "already-required cryptography library), no SQLCipher "
+                                       "native dependency"},
+        "subscriptions": {"state": "parked",
+                          "detail": "no subscription billing; fiat features wait for the payments "
+                                    "system and legal review (source of truth section 11)"},
+        "in_app_credit_transfers": {"state": "not_wired",
+                                    "detail": "the hub has a loopback-only /api/credits/transfer, "
+                                              "but no app calls it yet"},
+        "cash_payments": {"state": "parked",
+                          "detail": "credits are closed-loop TEST credits with no cash value; "
+                                    "nothing is redeemable until the payments and legal gate opens"},
+    }
     return {"status": "OK", "schema": TELEMETRY_SCHEMA, "version": VERSION, "generated_at_ms": now_ms(),
             "counters_since_ms": int(STATE.start_time * 1000),
             "counters_note": "since-start counters are in memory and reset when the daemon restarts",
             "protocols": protocols, "security": security, "finance": _finance_summary(),
-            "users": users, "services": services}
+            "users": users, "services": services, "capabilities": capabilities}
 
 class BodyError(Exception):
     def __init__(self, status: int, message: str):
@@ -4382,6 +4515,7 @@ class TelemetryHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "catchup": STATE.last_catchup,
                 "wan": WAN.snapshot() if WAN else None,
+                "ble": {**BLE_NEARBY.snapshot(), "met": BLE_MET.snapshot()},
                 "relay": relay_status() if RELAY is not None else {"enabled": False},
                 "inbound_peers": sum(1 for v in list(STATE.inbound_peers.values())
                                      if now - v["last_seen"] < INBOUND_PEER_TTL),
@@ -4466,6 +4600,8 @@ USER_POST_ROUTES = {
     "/api/profile/social-import": (SOCIAL_IMPORT_MAX_BYTES, lambda h, d: store_user_event(
         d, {SOCIAL_IMPORT_ACTION: validate_social_import}, _via(h))),
     "/api/telemetry/app-checkin": (4 * 1024, lambda h, d: app_checkin(d)),
+    "/api/ble/nearby": (4 * 1024, lambda h, d: ble_nearby_report(d)),
+    "/api/ble/met": (8 * 1024, lambda h, d: ble_met_report(d)),
 }
 
 
@@ -4579,61 +4715,6 @@ class _LpeCtx:
 LPE_CTX = _LpeCtx()
 
 
-_FORGET_PUBKEY_RE = re.compile(r"[0-9a-f]{64}")
-
-
-def lpe_forget_author(data) -> tuple:
-    """Operator prune (the "burial"): permanently delete THIS node's stored LPE
-    events for one author pubkey. POST /api/lpe/forget {"pubkey": "<64 hex>"}.
-
-    Why this exists: LPE profiles are replayed from person-signed events, and a
-    retraction would have to be signed by the author's own key — useless when the
-    key is lost or an install is destroyed (a rotated identity leaves an orphaned
-    profile no one can ever sign as again). The node operator is sovereign over
-    their own store, so the prune is a local operator action, not an event.
-
-    Safety rails:
-    - Loopback only in practice: the path is registered in USER_POST_ROUTES but
-      never added to REMOTE_POST_PATHS, so remote_gate refuses non-loopback
-      callers, and on Android the local token is still required.
-    - The target must be a full 64-hex pubkey; the node's own key is refused
-      (quarantine rows are node-authored and never a prune target anyway).
-    - Only this node's rows are deleted. Peers that already hold a copy keep
-      theirs, and a peer can re-offer a pruned event later — a prune is a local
-      burial, not a network-wide retraction.
-    Returns per-action removal counts so the operator can verify the burial.
-    """
-    if not isinstance(data, dict):
-        return {"status": "ERROR", "message": "JSON object body required"}, 400
-    pk = data.get("pubkey")
-    if not isinstance(pk, str) or not _FORGET_PUBKEY_RE.fullmatch(pk):
-        return {"status": "ERROR", "message": "'pubkey' must be a full 64-hex author pubkey"}, 400
-    if pk == STATE.node_id:
-        return {"status": "ERROR", "message": "refusing to prune the node's own key"}, 400
-    db_path = _db_path()
-    if not db_path.exists():
-        return {"status": "OK", "pubkey": pk, "removed": 0, "by_action": {}}, 200
-    marks = ",".join("?" for _ in LPE_ACTIONS)
-    conn = sqlite3.connect(str(db_path), timeout=10.0)
-    try:
-        rows = conn.execute(
-            f"SELECT action, COUNT(*) FROM events WHERE action IN ({marks}) AND author_pubkey = ? "
-            "GROUP BY action", (*LPE_ACTIONS, pk)).fetchall()
-        by_action = {a: n for a, n in rows if n}
-        removed = sum(by_action.values())
-        if removed:
-            conn.execute(
-                f"DELETE FROM events WHERE action IN ({marks}) AND author_pubkey = ?",
-                (*LPE_ACTIONS, pk))
-            conn.commit()
-    finally:
-        conn.close()
-    if removed:
-        with _LPE_CACHE_LOCK:
-            _LPE_CACHE.update(key=None, events=[])
-    return {"status": "OK", "pubkey": pk, "removed": removed, "by_action": by_action}, 200
-
-
 def _lpe_get(path):
     return lambda h, q: lpe_module().GET_ROUTES[path](LPE_CTX, q)
 
@@ -4650,7 +4731,6 @@ REMOTE_GET_PATHS.update(LPE_GET_PATHS)
 REMOTE_POST_PATHS.update(LPE_REMOTE_POST_PATHS)
 RESERVED_USER_ACTIONS.update(LPE_PERSON_ACTIONS)
 RESERVED_USER_ACTIONS[LPE_NODE_ACTION] = "/api/lpe/quarantine"
-USER_POST_ROUTES["/api/lpe/forget"] = (2 * 1024, lambda h, d: lpe_forget_author(d))   # operator prune: loopback + local token only (never in REMOTE_POST_PATHS)
 # === end LPE hooks ===============================================================================
 
 
@@ -5947,6 +6027,7 @@ def encounters_list() -> dict:
 
 
 NODE_FEATURES.append("encounters")
+NODE_FEATURES.append("ble_discovery")
 # === end encounters ==============================================================================
 
 
@@ -6644,6 +6725,13 @@ def main():
     print(f"[✓] Event time format: {'legacy float timestamp' if LEGACY_FLOAT_TS else 'int-ms ts'} for events this node stamps")
     print("------------------------------------------------------------------", flush=True)  # show in daemon.log now
 
+    BLE_NEARBY.set_own(STATE.node_id)
+    BLE_MET.bind(ble_met_path())
+    for _host, _port, _nid in BLE_MET.dial_targets():   # re-register endpoints met before this restart
+        try:
+            add_radio_peer({"host": _host, "port": _port, "transport": "ble", "node_hash": _nid})
+        except Exception:
+            pass
     t1 = threading.Thread(target=udp_discovery_broadcaster, daemon=True)
     t2 = threading.Thread(target=udp_discovery_listener, daemon=True)
     t3 = threading.Thread(target=catchup_loop, daemon=True)

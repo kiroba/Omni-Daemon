@@ -186,7 +186,7 @@ class TelemetrySummaryTests(unittest.TestCase):
         for section in ("protocols", "security", "finance", "users", "services"):
             self.assertIn(section, s)
         ids = [p["id"] for p in s["protocols"]]
-        self.assertEqual(ids, ["tcp_api", "p2p_sync", "udp_discovery", "negentropy", "signaling", "turn"])
+        self.assertEqual(ids, ["tcp_api", "p2p_sync", "udp_discovery", "ble_discovery", "negentropy", "signaling", "turn"])
         for p in s["protocols"]:
             self.assertIn("state", p)
             self.assertIn("last_seen_ago_s", p)
@@ -196,6 +196,26 @@ class TelemetrySummaryTests(unittest.TestCase):
         self.assertEqual(self.d.proto(s, "turn")["configured"], False)
         self.assertEqual(self.d.proto(s, "negentropy")["state"], "idle")      # no run yet (interval 0)
         self.assertEqual(self.d.proto(s, "tcp_api")["listen"], ["127.0.0.1"])
+
+    def test_capabilities_block(self):
+        code, s, _raw = self.d.summary()
+        self.assertEqual(code, 200)
+        caps = s["capabilities"]
+        self.assertEqual(set(caps), {"gossipsub", "ble_discovery", "nat_hole_punching",
+                                     "call_media_stats", "hardware_attestation", "store_encryption",
+                                     "subscriptions", "in_app_credit_transfers", "cash_payments"})
+        for entry in caps.values():
+            self.assertIn(entry["state"], ("not_wired", "parked", "wired"))
+            self.assertGreater(len(entry["detail"]), 20)
+        # Fiat stays parked behind the payments/legal gate; no card may claim otherwise.
+        self.assertEqual(caps["subscriptions"]["state"], "parked")
+        self.assertEqual(caps["cash_payments"]["state"], "parked")
+        self.assertIn("TEST credits", caps["cash_payments"]["detail"])
+        # Honesty guard: nothing in the summary may credit a hosted relay product
+        # the design replaced, and unwired modules must not be described as running.
+        blob = json.dumps(s).lower()
+        self.assertNotIn("tailscale", blob)
+        self.assertIn("not run by the live server", caps["gossipsub"]["detail"])
 
     def test_rejects_parameters(self):
         code, body, _ = _http(f"{self.d.ipc}/api/telemetry/summary?limit=5")
