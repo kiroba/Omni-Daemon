@@ -147,6 +147,29 @@ class BleMetDaemonTests(unittest.TestCase):
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.d.node_id)).verify(
             bytes.fromhex(body["sig"]), hello_bytes(body["node_id"], body["mesh_id"], body["ts"]))
 
+    def test_summary_reports_met_accepted_and_rejected(self):
+        # Mesh-Monitor's live BLE tile reads the telemetry summary (not node-health):
+        # it must carry the full met picture - stored, accepted and rejected - so a
+        # refused introduction is visible in the app, not only in the daemon.
+        def met_counts():
+            code, s, _ = self.d.summary()
+            self.assertEqual(code, 200, s)
+            return self.d.proto(s, "ble_discovery")["counts"]
+
+        before = met_counts()
+        sk, pub = make_peer()
+        code, body, _ = _http(f"{self.d.ipc}/api/ble/met", intro(sk, pub, self.d.mesh))
+        self.assertEqual(code, 200, body)
+        other, _ = make_peer()
+        bad = intro(sk, pub, self.d.mesh)
+        bad["sig"] = other.sign(hello_bytes(pub, self.d.mesh, bad["ts"])).hex()
+        code, body, _ = _http(f"{self.d.ipc}/api/ble/met", bad)
+        self.assertEqual(code, 401, body)
+        after = met_counts()
+        self.assertEqual(after["met"], before["met"] + 1)
+        self.assertEqual(after["met_accepted"], before["met_accepted"] + 1)
+        self.assertEqual(after["met_rejected"], before["met_rejected"] + 1)
+
     def test_sighting_alone_makes_no_met(self):
         before, _ = self.met_count()
         _, pub = make_peer()
