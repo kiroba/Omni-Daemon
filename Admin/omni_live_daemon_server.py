@@ -158,7 +158,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.33.0"
+VERSION = "8.33.1"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -4262,7 +4262,8 @@ def build_telemetry_summary() -> dict:
          "state": "up", "detail": "sightings reported by the node radio layer; hints only, never peers",
          "last_seen_ago_s": BLE_NEARBY.snapshot()["last_seen_ago_s"], "nearby": BLE_NEARBY.snapshot()["nearby"],
          "counts": {"reports": BLE_NEARBY.snapshot()["reports"], "rejected": BLE_NEARBY.snapshot()["rejected"],
-                    "met": BLE_MET.count(), "met_accepted": BLE_MET.snapshot()["accepted"]}},
+                    "met": BLE_MET.count(), "met_accepted": BLE_MET.snapshot()["accepted"],
+                    "met_rejected": BLE_MET.snapshot()["rejected"]}},
         {"id": "negentropy", "name": "Catch-up sync (negentropy v1)",
          "state": "idle" if catchup is None else ("degraded" if catchup["errors"] else "up"),
          "static_peers": len(STATE.sync_peers), "interval_s": _env_float(CATCHUP_INTERVAL_ENV, 60.0),
