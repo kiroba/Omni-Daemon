@@ -717,7 +717,8 @@ class NodeCore:
                 elif not st:
                     radios = {"line": W.STARTING, "color": W.TEXT_2, "ask_permission": False}
                 else:
-                    radios = {"line": W.radios_line(st.get("ble", ""), st.get("ble_nearby", 0), st.get("wifi_aware", "")),
+                    radios = {"line": W.radios_line(st.get("ble", ""), st.get("ble_nearby", 0), st.get("wifi_aware", ""),
+                                                    st.get("ble_met", 0), st.get("ble_intro")),
                               "color": W.TEXT_2, "ask_permission": False}
 
             state = {

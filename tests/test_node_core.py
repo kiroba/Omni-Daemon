@@ -220,6 +220,31 @@ class OneStateEveryPlatform(unittest.TestCase):
             core.settings.set(internet_on=False)
             self.assertIn(W.INTERNET_ROUTER_OFF, core.ui_state()["internet"]["line"])
 
+    def test_radios_ble_intro_line(self):
+        # NodeRadio's ble_intro ledger (radio_status.json) must reach the screen: until this
+        # wiring the core dropped ble_met/ble_intro and a failed GATT introduction left no
+        # trace anywhere in the Node UI (field tests #1/#2, Nov 12-13).
+        status = {"ble": "on", "ble_nearby": 1, "wifi_aware": "off", "ble_met": 1,
+                  "ble_intro": {"attempts": 3, "connected": 1, "read_ok": 0, "posted": 1,
+                                "served": 2, "served_empty": 1,
+                                "last": {"stage": "connect_failed", "detail": "gatt status 133",
+                                         "at_ms": 1}}}
+        env = dict(ANDROID, radios={"missing": False, "status": status})
+        with _Home() as home:
+            line = offline_core(env, home, HEALTH).ui_state()["radios"]["line"]
+        self.assertEqual(line, "Bluetooth: on · 1 nearby\nWi-Fi Aware: off\n"
+                               "Introductions: 3 tries · 1 connected · 0 read · 1 posted · 2 served · "
+                               "1 served empty · last: connect_failed (gatt status 133)")
+        # No ledger yet (fresh node / older radio): the original two lines, word for word.
+        self.assertEqual(W.radios_line("on", 2, "on"), "Bluetooth: on · 2 nearby\nWi-Fi Aware: on")
+        self.assertEqual(W.radios_line("on", 0, "off", 0, {"attempts": 0, "last": None}),
+                         "Bluetooth: on\nWi-Fi Aware: off\n"
+                         "Introductions: 0 tries · 0 connected · 0 read · 0 posted · 0 served")
+        # A posted count alone (ble_met without a ledger dict) still shows.
+        self.assertEqual(W.radios_line("on", 1, "off", 2),
+                         "Bluetooth: on · 1 nearby\nWi-Fi Aware: off\n"
+                         "Introductions: 0 tries · 0 connected · 0 read · 2 posted · 0 served")
+
     def test_update_banner(self):
         with _Home() as home:
             core = offline_core(DESKTOP, home)
