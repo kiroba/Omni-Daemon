@@ -311,9 +311,37 @@ RADIOS_TITLE = "Nearby radios"
 RADIOS_NEED_PERMISSION = "Bluetooth and Wi-Fi Aware need the Nearby devices permission. Tap to allow."
 
 
-def radios_line(ble: str, ble_nearby: int, wifi_aware: str) -> str:
+def _intro_count(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def radios_line(ble: str, ble_nearby: int, wifi_aware: str, ble_met=0, ble_intro=None) -> str:
     n = int(ble_nearby or 0)
-    return f"Bluetooth: {ble or 'off'}" + (f" · {n} nearby" if n > 0 else "") + f"\nWi-Fi Aware: {wifi_aware or 'off'}"
+    line = f"Bluetooth: {ble or 'off'}" + (f" · {n} nearby" if n > 0 else "") + f"\nWi-Fi Aware: {wifi_aware or 'off'}"
+    # BLE introduction ledger (NodeRadio radio_status.json "ble_intro", Omni-Node-Daemon PR #19):
+    # without this line the ledger is written but never rendered, so a failed GATT introduction
+    # leaves no trace on the node screen. Older radios/status payloads carry neither field and
+    # keep the two-line form above, word for word.
+    if not isinstance(ble_intro, dict) and not _intro_count(ble_met):
+        return line
+    intro = ble_intro if isinstance(ble_intro, dict) else {}
+    posted = _intro_count(intro.get("posted", ble_met))
+    parts = [f"Introductions: {_intro_count(intro.get('attempts'))} tries",
+             f"{_intro_count(intro.get('connected'))} connected",
+             f"{_intro_count(intro.get('read_ok'))} read",
+             f"{posted} posted",
+             f"{_intro_count(intro.get('served'))} served"]
+    if _intro_count(intro.get("served_empty")):
+        parts.append(f"{_intro_count(intro.get('served_empty'))} served empty")
+    last = intro.get("last")
+    if isinstance(last, dict) and last.get("stage"):
+        stage = str(last["stage"])[:40]
+        detail = str(last.get("detail") or "")[:120]
+        parts.append(f"last: {stage}" + (f" ({detail})" if detail else ""))
+    return line + "\n" + " · ".join(parts)
 
 
 # ---- Internet ----
