@@ -1,4 +1,4 @@
-# Internet without Tailscale (daemon v8.21.0)
+# Internet reach: rendezvous, dial-out, and relays (daemon v8.21.0)
 
 ## What works
 - **Any node that can dial a reachable node is on the mesh.** A phone behind carrier NAT dials out to a

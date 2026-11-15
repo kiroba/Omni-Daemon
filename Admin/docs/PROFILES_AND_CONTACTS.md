@@ -75,7 +75,7 @@ A card is signed by its own key (domain-separated by `type`):
 `GET /api/hub/card` → node-signed `{"type": "omni.hub-card.v1", node_id, mesh_id, version, ipc_port,
 telemetry_port, addresses, remote_hub, ts, sig}` plus `qr: "omni://hub?c=…"`. `sig` is by `node_id`
 with the card rule above. The **bearer token is never in it**; testers still copy `~/.omni/hub_token`
-separately. `addresses` = the listen hosts plus the Tailscale IP when one is found.
+separately. `addresses` = the listen hosts plus any CGNAT-range (100.64.0.0/10) address when one is found.
 
 ## Invite codes
 

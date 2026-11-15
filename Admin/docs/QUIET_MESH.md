@@ -64,7 +64,7 @@ match from IP X makes the node open a signed session to X on the port that devic
 A beacon alone never makes a peer live: only a completed session does, so a replayed beacon gets nobody in.
 
 Sent to the directed broadcast address of every private IPv4 interface only (10/8, 172.16/12, 192.168/16),
-never to `255.255.255.255`, Tailscale/CGNAT (100.64/10), link-local or loopback. Linux and Android read
+never to `255.255.255.255`, CGNAT (100.64/10), link-local or loopback. Linux and Android read
 each interface's netmask; Windows and macOS use the host's addresses with an assumed /24.
 `OMNI_QUIET_BEACON_TARGETS="host:udpport,..."` adds unicast targets (labs, a tailnet, the tests).
 
@@ -100,7 +100,7 @@ bound to the client's IP; a counter is accepted once. With a valid session the m
 known-peer gate are not needed; events inside are still hash- and signature-checked like before.
 
 Clients use this automatically for every peer call (live relay, catch-up, hello/dial-back, signal
-forwarding). Paired devices are dialed at the address they were last seen at, so pairing over Tailscale
+forwarding). Paired devices are dialed at the address they were last seen at, so pairing over a remote link
 or a reachable public address keeps working without beacons.
 
 ## What it does not do (honest list)
