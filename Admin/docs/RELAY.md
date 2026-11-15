@@ -41,7 +41,7 @@ whose node only knows your PC still gets your PC's TURN.
 ## Safety limits
 - Peers on loopback, link-local, multicast or unspecified addresses: always refused (403).
 - Private and carrier-NAT ranges (RFC 1918, 100.64/10): refused unless `OMNI_RELAY_ALLOW_PRIVATE=1`.
-  This keeps the relay from becoming a doorway into the host or its LAN. Turn it on for Tailscale testers.
+  This keeps the relay from becoming a doorway into the host or its LAN. Turn it on for testers on private or carrier-NAT paths.
 - `OMNI_RELAY_MAX_ALLOC` (16) allocations, 4 per credential.
 - `OMNI_RELAY_MAX_KBPS` (2500) per allocation; excess packets are dropped.
 - `OMNI_RELAY_MAX_MB_DAY` (0 = unlimited); when spent, new allocations get 486.

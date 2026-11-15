@@ -40,7 +40,7 @@ reconciliation** and fetch only the events they lack.
 
 - Same-mesh peers found by UDP discovery (`OMNI_MESH_ID`, see [MESH_ID.md](MESH_ID.md)).
 - Plus `OMNI_SYNC_PEERS`, a comma-separated list of `host[:port]` P2P endpoints (port defaults to
-  5005), for peers that beacons don't reach, such as over Tailscale:
+  5005), for peers that beacons don't reach, such as across the internet:
   `OMNI_SYNC_PEERS=100.64.0.7:5005,laptop.tail1234.ts.net`. A malformed entry stops the daemon with
   exit code 2 instead of being dropped silently.
 

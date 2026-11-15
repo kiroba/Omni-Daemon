@@ -78,12 +78,12 @@ with CORS headers (`GET, POST, OPTIONS`; `Content-Type, Authorization`).
 | Hub setting in the app | `:5000` base | `:9100` base | Token |
 |---|---|---|---|
 | **This phone** (daemon on the same device) | `http://127.0.0.1:5000` | `http://127.0.0.1:9100` | none |
-| **Remote hub** over Tailscale | `http://100.x.y.z:5000` (hub's Tailscale IP) | `http://100.x.y.z:9100` | `Authorization: Bearer <token>` |
+| **Remote hub** over the network | `http://<hub-address>:5000` | `http://<hub-address>:9100` | `Authorization: Bearer <token>` |
 
-Remote hub mode is off unless the hub runs with `OMNI_HUB_REMOTE=1` and `OMNI_HUB_BIND=<tailscale ip | 0.0.0.0>`.
+Remote hub mode is off unless the hub runs with `OMNI_HUB_REMOTE=1` and `OMNI_HUB_BIND=<hub address | 0.0.0.0>`.
 The token is created once at `~/.omni/hub_token` (override: `OMNI_HUB_TOKEN_FILE`), printed at
 startup and kept across restarts. Delete the file and restart the daemon to rotate it. Setup is in
-[REMOTE_HUB.md](REMOTE_HUB.md). Keep these ports on Tailscale, because the daemon speaks plain HTTP.
+[REMOTE_HUB.md](REMOTE_HUB.md). Keep these ports on networks you trust, because the daemon speaks plain HTTP.
 
 ```bash
 TOKEN=$(cat ~/.omni/hub_token)            # on the hub
@@ -632,7 +632,7 @@ Every few seconds each daemon broadcasts a JSON beacon to `<broadcast>:9101`, si
 ```
 Listeners ignore beacons from other meshes. With an allowlist, beacons must come from a trusted key.
 Unsigned (pre-8.9) beacons are accepted only with no allowlist and `OMNI_REQUIRE_SIGNED_BEACONS` off. Accepted senders
-become `active_peers` (15 s freshness) for relay and catch-up. Beacons don't cross Tailscale; use `OMNI_SYNC_PEERS`
+become `active_peers` (15 s freshness) for relay and catch-up. Beacons don't leave the LAN; use `OMNI_SYNC_PEERS`
 there. **From code, not live-tested.**
 
 ---
