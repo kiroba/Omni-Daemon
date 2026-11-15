@@ -45,9 +45,44 @@ SIGNED_EVENTS.md): `{"action": "game_match", "author_pubkey", "previous_hash", "
 rate limit (429) and stores the event as signed by the player. The signed `payload` must already be in the
 clean form above (lowercase ids, no nulls, `"schema": 1`), because the node can't change signed bytes (400).
 
+### Signed result envelopes (v8.33.2) — one contract for every game
+
+A multiplayer result is signed by **every participant**, not one author:
+`{"type": <type>, "payload": {...}, "signatures": {<role>: <128-hex sig>, ...}}`. Each registered type
+declares its payload fields (in canonical order), which payload field carries each signer's pubkey, and a
+domain prefix. The signed bytes are the prefix + the payload's JSON serialized in the registered field
+order (compact separators); the node rebuilds those bytes from the validated payload — never from the
+sender's raw text — and verifies **every** signature before storing anything (400 malformed or unknown
+type, 401 any signature fails). Participant pubkeys must differ. The full envelope becomes the
+`game_match` event payload (the chain event itself is node-signed, like a bare summary), so the
+participants' signatures stay auditable in the store, in the feed (`?type=game_match`) and over sync.
+A new game adds one `SIGNED_RESULT_TYPES` registration in `omni_live_daemon_server.py`; no new endpoint.
+
+First registered type, `pvp_match` (Plaza Brawler PvP, spec S3; prefix `pvp-result|`; the host is P1):
+
+| field | rule |
+|---|---|
+| `v` | **required**, must be `1` |
+| `session_id` | **required**, 32 lowercase hex chars |
+| `seed` | **required** int 0-2,147,483,647 |
+| `host_pubkey`, `guest_pubkey` | **required**, 64-char lowercase hex Ed25519 pubkeys (the signer keys) |
+| `p1_sign`, `p2_sign` | **required**, 1-32 chars `a-z 0-9 _` |
+| `winner` | **required**, `"p1"`, `"p2"` or `"draw"` |
+| `wins` | **required**, exactly two ints 0-99 |
+| `rounds` | **required** int 0-99 |
+| `duration_ms` | **required** int 0-86,400,000 |
+| `final_state_hash` | **required**, 64 lowercase hex chars |
+
+All fields are required and no others are allowed; values are stored exactly as sent (never normalised —
+the signatures cover them). `signatures` must carry exactly the roles `host` and `guest`, signing for
+`host_pubkey` and `guest_pubkey` respectively. Success answers `"signed_by":"players"` plus
+`"result_type":"pvp_match"`. In `GET /api/games/matches`, envelope results appear with
+`"signed_by":"players"` and a `match` of `{"game", "result_type", ...payload fields}`; their participant
+signatures are re-verified on read, so a relayed envelope this node cannot verify is not listed.
+
 Responses:
 
-- `200 {"status":"SUCCESS","event_id":"0x…","signed_by":"node"|"player","ts":<ms>}` (a replayed signed
+- `200 {"status":"SUCCESS","event_id":"0x…","signed_by":"node"|"player"|"players","ts":<ms>}` (a replayed signed
   event adds `"result":"ALREADY_EXISTS"`)
 - `400` bad body / field, `401` bad token or bad player signature, `411` empty body, `413` over 4 KB,
   `429` player key rate-limited, `404` on nodes older than 8.28.0.

@@ -1,9 +1,14 @@
 """Game match results (daemon v8.28.0): POST /api/games/match, GET /api/games/matches, node-health
 "features". Run: python3 -m unittest tests.test_games_match
 
+v8.33.2 adds shape 3, the generic signed result envelope (SignedResultValidation /
+SignedResultApi below): the body Plaza Brawler's PvP S3 sends is PvpMatchEnvelope.toJson()
+from kiroba/Plaza-Brawler lib/net/pvp_result.dart, signed over pvpResultBytes.
+
 Starts real daemons on free temp ports (tests/daemon_harness.py). The body Plaza Brawler sends is
 MatchShare.payloadFrom(...) from kiroba/Plaza-Brawler lib/net/match_share.dart (spec 5.3).
 """
+import json
 import secrets
 import shutil
 import sys
@@ -26,6 +31,28 @@ ZERO = "0x" + "0" * 64
 def signed_match(key: Key, payload: dict, ts: int = None) -> dict:
     return key.sign_event({"action": "game_match", "author_pubkey": key.pub, "previous_hash": ZERO,
                            "ts": ts or now_ms(), "payload": payload})
+
+
+def client_result_bytes(payload: dict) -> bytes:
+    """Exactly pvpResultBytes (kiroba/Plaza-Brawler lib/net/pvp_session.dart): the "pvp-result|"
+    prefix plus the payload's canonical JSON — pvpMatchPayload's field order, compact separators."""
+    return ("pvp-result|" + json.dumps(payload, separators=(",", ":"),
+                                       ensure_ascii=False)).encode("utf-8")
+
+
+def pvp_payload(host: Key, guest: Key) -> dict:
+    """A Plaza Brawler S3 result payload, keys in pvpMatchPayload's canonical order."""
+    return {"v": 1, "session_id": "0123456789abcdef" * 2, "seed": 123456789,
+            "host_pubkey": host.pub, "guest_pubkey": guest.pub,
+            "p1_sign": "aries", "p2_sign": "scorpio", "winner": "p1", "wins": [2, 0],
+            "rounds": 2, "duration_ms": 61000, "final_state_hash": "ab" * 32}
+
+
+def pvp_envelope(host: Key, guest: Key, payload: dict) -> dict:
+    """The envelope PvpMatchEnvelope.toJson() sends and MatchShare.sharePvpMatch POSTs."""
+    signed = client_result_bytes(payload)
+    return {"type": "pvp_match", "payload": payload,
+            "signatures": {"host": host.sign(signed), "guest": guest.sign(signed)}}
 
 
 class Validation(unittest.TestCase):
@@ -231,6 +258,152 @@ class GamesMatchSync(unittest.TestCase):
             a.stop()
             b.stop()
             shutil.rmtree(root, ignore_errors=True)
+
+
+class SignedResultValidation(unittest.TestCase):
+    """Unit level (daemon v8.33.2): the generic signed-result verifier behind shape 3, signed
+    exactly as the Brawler client signs — real Ed25519 keys, the client's canonical bytes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = daemon_module()
+        cls.host, cls.guest = Key(), Key()
+        cls.payload = pvp_payload(cls.host, cls.guest)
+
+    def test_canonical_bytes_match_client(self):
+        reg = self.m.SIGNED_RESULT_TYPES["pvp_match"]
+        self.assertEqual(self.m.signed_result_bytes(reg, self.payload),
+                         client_result_bytes(self.payload))
+
+    def test_valid_envelope_parses_and_verifies(self):
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        reg, payload, sigs = self.m.parse_signed_result(env)
+        self.assertEqual(payload, self.payload)
+        self.assertTrue(self.m.signed_result_signatures_ok(reg, payload, sigs))
+
+    def test_wire_key_order_does_not_matter(self):
+        # The daemon rebuilds the canonical bytes itself: a payload whose keys arrive in
+        # another order still verifies against signatures made over the canonical order.
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        env["payload"] = dict(reversed(list(self.payload.items())))
+        reg, payload, sigs = self.m.parse_signed_result(env)
+        self.assertTrue(self.m.signed_result_signatures_ok(reg, payload, sigs))
+
+    def test_forged_and_tampered_fail_verification(self):
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        reg, payload, sigs = self.m.parse_signed_result(env)
+        forged = dict(sigs, guest=Key().sign(client_result_bytes(payload)))
+        self.assertFalse(self.m.signed_result_signatures_ok(reg, payload, forged))
+        tampered = dict(payload, winner="p2")
+        self.assertFalse(self.m.signed_result_signatures_ok(reg, tampered, sigs))
+
+    def test_parse_rejections(self):
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        bad = [
+            dict(env, type="chess_match"),                                  # unknown type
+            dict(env, signatures={"host": env["signatures"]["host"]}),      # missing guest sig
+            dict(env, signatures=dict(env["signatures"], ref="0" * 128)),   # unknown role
+            dict(env, signatures=dict(env["signatures"], guest="zz")),      # malformed sig
+            dict(env, payload=dict(self.payload, extra=1)),                 # unknown field
+            dict(env, payload=dict(self.payload, winner="p3")),
+            dict(env, payload=dict(self.payload, seed=True)),
+            dict(env, payload=dict(self.payload, seed=2 ** 31)),
+            dict(env, payload=dict(self.payload, wins=[2])),
+            dict(env, payload=dict(self.payload, wins=[2, 0, 1])),
+            dict(env, payload=dict(self.payload, session_id="AB" * 16)),    # uppercase hex
+            dict(env, payload=dict(self.payload, host_pubkey=self.guest.pub)),  # same player twice
+            dict(env, payload={k: v for k, v in self.payload.items() if k != "rounds"}),
+        ]
+        for b in bad:
+            with self.subTest(b=b), self.assertRaises(ValueError):
+                self.m.parse_signed_result(b)
+
+
+class SignedResultApi(unittest.TestCase):
+    """POST /api/games/match with a dual-signed pvp_match envelope (Plaza Brawler S3): stored as
+    a game_match event carrying the full envelope; anything unverified is refused, storing
+    nothing. The bare solo summary (shape 1) is unaffected."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="omni_pvp_"))
+        cls.d = Daemon(cls.tmp, "pvp").start()
+        cls.host, cls.guest = Key(), Key()
+        cls.payload = pvp_payload(cls.host, cls.guest)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.d.stop()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _game_match_count(self):
+        _code, s = self.d.get("/api/telemetry/summary")
+        return s["services"]["event_store"]["events_by_action"].get("game_match", 0)
+
+    def test_1_valid_envelope_accepted_and_stored(self):
+        before = self._game_match_count()
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        code, r = self.d.post("/api/games/match", env)
+        self.assertEqual(code, 200, r)
+        self.assertEqual(r["status"], "SUCCESS")
+        self.assertEqual(r["signed_by"], "players")
+        self.assertEqual(r["result_type"], "pvp_match")
+        self.assertRegex(r["event_id"], r"^0x[0-9a-f]{64}$")
+        # counts as a game_match in the telemetry summary (the Mesh Monitor events-by-type tile)
+        self.assertEqual(self._game_match_count(), before + 1)
+        # listed with the result fields, marked as player-signed
+        _code, lst = self.d.get("/api/games/matches", {"limit": 50})
+        mine = [m for m in lst["matches"] if m["event_id"] == r["event_id"]]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["signed_by"], "players")
+        self.assertTrue(mine[0]["verified"])
+        self.assertEqual(mine[0]["match"]["game"], "plaza_brawler")
+        self.assertEqual(mine[0]["match"]["result_type"], "pvp_match")
+        self.assertEqual(mine[0]["match"]["winner"], "p1")
+        self.assertEqual(mine[0]["match"]["host_pubkey"], self.host.pub)
+        self.assertEqual(mine[0]["match"]["guest_pubkey"], self.guest.pub)
+        # the stored event payload is the full envelope — signatures stay auditable
+        _code, feed = self.d.get("/api/events/feed", {"type": "game_match", "limit": 50})
+        stored = [e for e in feed["events"] if e["event_id"] == r["event_id"]]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["payload"], env)
+
+    def test_2_forged_signature_rejected_nothing_stored(self):
+        before = self._game_match_count()
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        env["signatures"]["guest"] = Key().sign(client_result_bytes(self.payload))
+        code, r = self.d.post("/api/games/match", env)
+        self.assertEqual(code, 401, r)
+        self.assertEqual(self._game_match_count(), before)
+
+    def test_3_missing_signature_rejected_nothing_stored(self):
+        before = self._game_match_count()
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        del env["signatures"]["guest"]
+        code, r = self.d.post("/api/games/match", env)
+        self.assertEqual(code, 400, r)
+        self.assertEqual(self._game_match_count(), before)
+
+    def test_4_tampered_payload_rejected_nothing_stored(self):
+        before = self._game_match_count()
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        env["payload"] = dict(self.payload, winner="p2")   # signatures no longer cover it
+        code, r = self.d.post("/api/games/match", env)
+        self.assertEqual(code, 401, r)
+        self.assertEqual(self._game_match_count(), before)
+
+    def test_5_unknown_envelope_type_rejected(self):
+        before = self._game_match_count()
+        env = pvp_envelope(self.host, self.guest, self.payload)
+        env["type"] = "chess_match"
+        code, r = self.d.post("/api/games/match", env)
+        self.assertEqual(code, 400, r)
+        self.assertEqual(self._game_match_count(), before)
+
+    def test_6_solo_summary_still_accepted(self):
+        code, r = self.d.post("/api/games/match", PB_PAYLOAD)
+        self.assertEqual(code, 200, r)
+        self.assertEqual(r["signed_by"], "node")
 
 
 if __name__ == "__main__":
