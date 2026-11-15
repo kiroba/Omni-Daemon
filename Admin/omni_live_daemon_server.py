@@ -158,7 +158,7 @@ import http.client
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "8.33.1"
+VERSION = "8.33.2"
 # v8.28.0: optional features this node serves, listed in GET :9100/api/v1/telemetry/node-health "features"
 # so an app can probe one without trial requests. Older nodes have no "features" key (treat as []).
 NODE_FEATURES = []
@@ -5164,12 +5164,16 @@ USER_POST_ROUTES["/api/wan/config"] = (1024, node_wan_config)
 
 # === Game match results (v8.28.0) ================================================================
 # POST /api/games/match stores one finished match (e.g. Plaza Brawler's MatchShare.payloadFrom, spec 5.3)
-# as a signed "game_match" chain event; GET /api/games/matches lists them newest first. Two body shapes:
+# as a signed "game_match" chain event; GET /api/games/matches lists them newest first. Three body shapes:
 #   1. A bare summary {"game": "plaza_brawler", "winner": "p1", ...}: signed by THIS node (the app is
 #      trusted because it passed the loopback local token or the remote-hub bearer), like a bug report.
 #   2. A person-signed envelope {"action": "game_match", "author_pubkey", "previous_hash", "ts", "payload",
 #      "signature"[, "event_id"]}: the player's Ed25519 signature is verified (store_user_event) and the
 #      event is stored as signed, so peers see who played.
+#   3. A signed result envelope {"type": <type>, "payload": {...}, "signatures": {<role>: <sig>, ...}}
+#      (v8.33.2): EVERY participant's signature over the type's canonical result bytes is verified by
+#      the generic SIGNED_RESULT_TYPES registry below, then the full envelope is stored as the
+#      game_match payload (node-signed chain event, like shape 1) so the signatures stay auditable.
 # Both relay to peers and sync over catch-up like any other event. Match results are not posts, so
 # /api/events/feed leaves game_match out unless ?type=game_match asks for it. See Admin/docs/GAMES_MATCH.md.
 GAME_MATCH_ACTION = "game_match"
@@ -5238,7 +5242,158 @@ def _game_match_validator(payload) -> dict:
     return payload
 
 
+# --- Generic signed game-result envelopes (v8.33.2) -------------------------------------------------
+# Shape 3 is one contract for every game, not a Brawler special case: a result envelope
+# {"type": <type>, "payload": {...}, "signatures": {<role>: <128-hex sig>, ...}} where EVERY
+# participant signs the same canonical bytes — the type's domain prefix + the payload serialized
+# in the registration's field order. The daemon rebuilds those bytes from the validated payload
+# (never from the sender's raw text, so wire key order or spacing cannot matter) and verifies
+# every signature before anything is stored. A new game registers one entry here — payload
+# schema + signer roles + prefix — and reuses this handler, the game_match event action and the
+# matches list; no new endpoint. Field kinds: "const" (exact value), "hex" (arg = char count,
+# lowercase), "pubkey", "id" (_GAME_ID_RE token), "winner", "int" (arg = max), "wins" (exactly
+# two ints, arg = max each). Values are validated as sent, never normalised: the signatures
+# cover them, so changing one would describe a different result.
+_PVP_MATCH_FIELDS = (("v", "const", 1),
+                     ("session_id", "hex", 32),
+                     ("seed", "int", 2 ** 31 - 1),
+                     ("host_pubkey", "pubkey", None),
+                     ("guest_pubkey", "pubkey", None),
+                     ("p1_sign", "id", None),
+                     ("p2_sign", "id", None),
+                     ("winner", "winner", None),
+                     ("wins", "wins", 99),
+                     ("rounds", "int", 99),
+                     ("duration_ms", "int", 24 * 3600 * 1000),
+                     ("final_state_hash", "hex", 64))
+SIGNED_RESULT_TYPES = {
+    # Plaza Brawler PvP (spec S3): both players sign "pvp-result|" + the canonical payload JSON
+    # (pvpResultBytes in kiroba/Plaza-Brawler lib/net/pvp_session.dart); the host is P1.
+    "pvp_match": {"game": "plaza_brawler", "prefix": b"pvp-result|", "fields": _PVP_MATCH_FIELDS,
+                  "signers": (("host", "host_pubkey"), ("guest", "guest_pubkey"))},
+}
+_SIGNED_RESULT_FIELDS = {"type", "payload", "signatures"}
+
+
+def _validate_signed_result_payload(reg: dict, payload) -> dict:
+    """The payload exactly as sent, field-checked against the registration, or ValueError.
+    Every registered field is required; unknown fields are refused (nothing unexpected is
+    stored or gossiped)."""
+    if not isinstance(payload, dict):
+        raise ValueError("envelope 'payload' must be a JSON object")
+    unknown = set(payload) - {name for name, _, _ in reg["fields"]}
+    if unknown:
+        raise ValueError(f"unknown payload field(s): {', '.join(sorted(unknown))}")
+    clean = {}
+    for name, kind, arg in reg["fields"]:
+        val = payload.get(name)
+        if val is None:
+            raise ValueError(f"'{name}' is required")
+        if kind == "const":
+            if isinstance(val, bool) or val != arg:
+                raise ValueError(f"'{name}' must be {arg}")
+        elif kind == "hex":
+            if not isinstance(val, str) or not re.fullmatch(r"[0-9a-f]{%d}" % arg, val):
+                raise ValueError(f"'{name}' must be {arg} lowercase hex chars")
+        elif kind == "pubkey":
+            if not isinstance(val, str) or not _PUBKEY_RE.fullmatch(val):
+                raise ValueError(f"'{name}' must be a 64-char lowercase hex Ed25519 public key")
+        elif kind == "id":
+            if not isinstance(val, str) or not _GAME_ID_RE.fullmatch(val):
+                raise ValueError(f"'{name}' must be 1-32 chars of a-z 0-9 _ "
+                                 "(starting with a letter or digit)")
+        elif kind == "winner":
+            if val not in _GAME_WINNERS:
+                raise ValueError("'winner' must be \"p1\", \"p2\" or \"draw\"")
+        elif kind == "int":
+            if isinstance(val, bool) or not isinstance(val, int) or not 0 <= val <= arg:
+                raise ValueError(f"'{name}' must be an integer from 0 to {arg}")
+        elif kind == "wins":
+            if (not isinstance(val, list) or len(val) != 2
+                    or any(isinstance(w, bool) or not isinstance(w, int) or not 0 <= w <= arg
+                           for w in val)):
+                raise ValueError(f"'{name}' must be two integers from 0 to {arg}")
+        clean[name] = val
+    return clean
+
+
+def signed_result_bytes(reg: dict, payload: dict) -> bytes:
+    """The canonical bytes every participant signed: the type's prefix + the payload's JSON in
+    the registration's field order with compact separators — byte-identical to what the
+    clients sign, regardless of how the sender ordered the keys on the wire."""
+    ordered = {name: payload[name] for name, _, _ in reg["fields"]}
+    return reg["prefix"] + json.dumps(ordered, separators=(",", ":"),
+                                      ensure_ascii=False).encode("utf-8")
+
+
+def parse_signed_result(data) -> tuple:
+    """(registration, clean payload, signatures) for a well-formed signed result envelope, or
+    ValueError. Signature verification itself is signed_result_signatures_ok."""
+    if not isinstance(data, dict):
+        raise ValueError("body must be a JSON object (a signed result envelope)")
+    unknown = set(data) - _SIGNED_RESULT_FIELDS
+    if unknown:
+        raise ValueError(f"unknown field(s): {', '.join(sorted(unknown))}")
+    rtype = data.get("type")
+    if not isinstance(rtype, str) or rtype not in SIGNED_RESULT_TYPES:
+        raise ValueError(f"unknown signed result type: {rtype!r} (registered: "
+                         f"{', '.join(sorted(SIGNED_RESULT_TYPES))})")
+    reg = SIGNED_RESULT_TYPES[rtype]
+    payload = _validate_signed_result_payload(reg, data.get("payload"))
+    signatures = data.get("signatures")
+    if not isinstance(signatures, dict):
+        raise ValueError("envelope 'signatures' must be a JSON object keyed by signer role")
+    unknown_roles = set(signatures) - {role for role, _ in reg["signers"]}
+    if unknown_roles:
+        raise ValueError(f"unknown signature role(s): {', '.join(sorted(unknown_roles))}")
+    for role, _field in reg["signers"]:
+        sig = signatures.get(role)
+        if sig is None:
+            raise ValueError(f"'signatures' is missing the '{role}' signature")
+        if not isinstance(sig, str) or not _USER_SIG_RE.fullmatch(sig):
+            raise ValueError(f"the '{role}' signature must be a 128-char lowercase hex "
+                             "Ed25519 signature")
+    keys = [payload[field] for _role, field in reg["signers"]]
+    if len(set(keys)) != len(keys):
+        raise ValueError("participant pubkeys must differ (a result needs distinct players)")
+    return reg, payload, signatures
+
+
+def signed_result_signatures_ok(reg: dict, payload: dict, signatures: dict) -> bool:
+    """True only when EVERY participant's signature verifies over the canonical result bytes
+    against the pubkey the payload itself names for that role."""
+    data = signed_result_bytes(reg, payload)
+    return all(_ed25519_ok(payload[field], signatures[role], data)
+               for role, field in reg["signers"])
+
+
+def store_signed_result(data) -> tuple:
+    """A verified signed result envelope, stored as a game_match chain event (node-signed for
+    the chain, like a bare summary) whose payload is the full envelope — payload plus every
+    participant signature — so the result counts with all matches in the telemetry summary,
+    relays and syncs like any other event, and stays auditable end to end."""
+    try:
+        reg, payload, signatures = parse_signed_result(data)
+    except ValueError as e:
+        return {"status": "ERROR", "message": str(e)}, 400
+    if not signed_result_signatures_ok(reg, payload, signatures):
+        TELEMETRY.inc("games_match_rejected_signature")
+        return {"status": "ERROR", "message": "bad signature: every participant must sign the "
+                                              "canonical result bytes for this type"}, 401
+    envelope = {"type": data["type"], "payload": payload, "signatures": signatures}
+    resp, status = process_and_store_event({"action": GAME_MATCH_ACTION, "payload": envelope},
+                                           origin_peer=None, relay=True)
+    if status == 200:
+        TELEMETRY.inc("games_match_stored")
+        resp = {"status": "SUCCESS", "event_id": resp.get("event_id"), "signed_by": "players",
+                "result_type": data["type"], "ts": resp.get("ts"),
+                **({"result": resp["result"]} if resp.get("result") else {})}
+    return resp, status
+
+
 def store_game_match(h, data) -> tuple:
+    if isinstance(data, dict) and ("signatures" in data or "type" in data):
+        return store_signed_result(data)
     if isinstance(data, dict) and "signature" in data:
         resp, status = store_user_event(data, {GAME_MATCH_ACTION: _game_match_validator}, _via(h))
         signed_by = "player"
@@ -5272,15 +5427,30 @@ def list_game_matches(h, query) -> tuple:
     for _ in range(50):          # skip invalid / unverified / other-game rows without short pages
         page = _list_feed_events_before_omnimind(FEED_MAX_LIMIT, cursor, None, GAME_MATCH_ACTION)
         for ev in page["events"]:
-            try:
-                match = validate_game_match(ev["payload"])
-            except ValueError:
-                continue         # a peer can relay anything; invalid ones are ignored on read
+            raw = ev["payload"]
+            signed_by = "node" if ev["author_pubkey"] == STATE.node_id else "other"
+            if isinstance(raw, dict) and raw.get("type") in SIGNED_RESULT_TYPES:
+                # A stored signed result envelope: re-verify every participant signature on
+                # read — a peer can relay anything, so an envelope this node cannot verify
+                # is ignored here exactly like an invalid summary.
+                try:
+                    reg, payload, sigs = parse_signed_result(raw)
+                except ValueError:
+                    continue
+                if not signed_result_signatures_ok(reg, payload, sigs):
+                    continue
+                match = {"game": reg["game"], "result_type": raw["type"], **payload}
+                signed_by = "players"
+            else:
+                try:
+                    match = validate_game_match(raw)
+                except ValueError:
+                    continue         # a peer can relay anything; invalid ones are ignored on read
             if not ev["verified"] or (game and match["game"] != game):
                 continue
             matches.append({"id": ev["id"], "event_id": ev["event_id"], "ts_ms": ev["ts_ms"],
                             "author_pubkey": ev["author_pubkey"],
-                            "signed_by": "node" if ev["author_pubkey"] == STATE.node_id else "other",
+                            "signed_by": signed_by,
                             "origin": ev["origin"], "verified": True, "match": match})
         if len(matches) > limit or not page["has_more"]:
             more = len(matches) > limit or page["has_more"]
