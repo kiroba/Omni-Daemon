@@ -884,8 +884,14 @@ def relay_event_to_peers(event_envelope: dict, origin_peer: str = None):
             continue  # Skip relaying back to sender!
 
         try:
-            peer_request(peer_ip, peer_port, "/p2p/sync", json_bytes, timeout=2.0)
-            TELEMETRY.inc("relay_ok")
+            code, _ = peer_request(peer_ip, peer_port, "/p2p/sync", json_bytes, timeout=2.0)
+            if code == 200:
+                TELEMETRY.inc("relay_ok")
+                for sha in asset_refs(event_envelope.get("payload")):
+                    if not push_asset_to_peer(peer_ip, peer_port, sha):
+                        TELEMETRY.inc("relay_asset_failed")
+            else:
+                TELEMETRY.inc("relay_failed")
         except Exception:
             TELEMETRY.inc("relay_failed")
 
@@ -3120,6 +3126,16 @@ def _raw_post(host: str, port: int, path: str, body: bytes, headers: dict, timeo
     except urllib.error.HTTPError as e:
         return e.code, e.read()
 
+
+def _raw_get(host: str, port: int, path: str, headers: dict, timeout: float) -> tuple:
+    """GET from a peer without using the process or system HTTP proxy."""
+    req = urllib.request.Request(peer_url(host, port, path), method="GET", headers=headers)
+    try:
+        with _PEER_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
 def _json_or_empty(raw: bytes) -> dict:
     try:
         v = json.loads(raw) if raw else {}
@@ -3379,6 +3395,34 @@ def peer_request(host: str, port: int, path: str, body: bytes, timeout: float = 
         hdr = qm.session_header(s["sk"], s["sid"], ctr, "POST", path, body)
         try:
             code, raw = _raw_post(host, port, path, body, {qm.SESSION_HEADER: hdr}, timeout)
+            if s.get("paired"):
+                with STATE.lock:
+                    live = STATE.paired_live.get(s["peer"])
+                    if live:
+                        live["last_seen"] = time.time()
+            return code, raw
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            with STATE.lock:
+                if STATE.sessions_cli.get((host, int(port))) is s:
+                    STATE.sessions_cli.pop((host, int(port)), None)
+            if attempt == 1:
+                raise
+    raise PeerUnavailable("unreachable")
+
+
+# Peer asset reads use the same mesh header or signed quiet-mesh session as POSTs.
+def peer_get(host: str, port: int, path: str, timeout: float = 10.0) -> tuple:
+    """GET from a peer, using the mesh header or a signed quiet-mesh session."""
+    if not quiet_active():
+        return _raw_get(host, port, path, {MESH_HEADER: STATE.mesh_id}, timeout)
+    for attempt in (0, 1):
+        s = client_session(host, port, force=attempt == 1)
+        with s["lock"]:
+            s["ctr"] += 1
+            ctr = s["ctr"]
+        hdr = qm.session_header(s["sk"], s["sid"], ctr, "GET", path, b"")
+        try:
+            code, raw = _raw_get(host, port, path, {qm.SESSION_HEADER: hdr}, timeout)
             if s.get("paired"):
                 with STATE.lock:
                     live = STATE.paired_live.get(s["peer"])
@@ -3718,7 +3762,8 @@ def reconcile_with_peer(host: str, port: int) -> dict:
     """Client side of one catch-up: reconcile, pull what we lack (verified), push what they lack."""
     t0 = time.time()
     stats = {"peer": f"{host}:{port}", "rounds": 0, "bytes": 0, "need": 0, "have": 0, "stored": 0,
-             "already": 0, "rejected": 0, "missing": 0, "pushed": 0, "push_failed": 0, "error": None}
+             "already": 0, "rejected": 0, "missing": 0, "pushed": 0, "push_failed": 0,
+             "assets_fetched": 0, "assets_pushed": 0, "assets_failed": 0, "error": None}
     try:
         try:
             say_hello(host, port)        # lets a peer that can't dial us back serve this catch-up
@@ -3766,6 +3811,11 @@ def reconcile_with_peer(host: str, port: int) -> dict:
                     stats["already"] += 1
                 else:
                     stats["stored"] += 1
+                for sha in asset_refs(env.get("payload")):
+                    if fetch_asset_from_peer(host, port, sha):
+                        stats["assets_fetched"] += 1
+                    else:
+                        stats["assets_failed"] += 1
             rest = [e for e in batch if e not in got]
             if resp.get("truncated") and rest and len(got) > 0:
                 pending = rest + pending     # response hit the size cap: ask again for the rest
@@ -3779,6 +3829,11 @@ def reconcile_with_peer(host: str, port: int) -> dict:
                 stats["bytes"] += n
                 if code == 200:
                     stats["pushed"] += 1
+                    for sha in asset_refs(env.get("payload")):
+                        if push_asset_to_peer(host, port, sha):
+                            stats["assets_pushed"] += 1
+                        else:
+                            stats["assets_failed"] += 1
                 else:
                     stats["push_failed"] += 1
     except Exception as e:
@@ -4462,7 +4517,8 @@ def remote_gate(handler, method: str, path: str) -> bool:
         TELEMETRY.inc("api_requests_loopback")
         return True
     allowed = REMOTE_POST_PATHS if method == "POST" else REMOTE_GET_PATHS
-    if not HUB_REMOTE or STATE.hub_token is None or path not in allowed:
+    dynamic_asset = path.startswith("/api/assets/") and bool(re.fullmatch(r"/api/assets/[0-9a-f]{64}", path))
+    if not HUB_REMOTE or STATE.hub_token is None or (path not in allowed and not dynamic_asset):
         TELEMETRY.inc("api_denied_loopback_only")
         _deny(handler, 403, "loopback only")
         return False
@@ -4597,6 +4653,123 @@ class TelemetryHandler(BaseHTTPRequestHandler):
 
 def _via(handler) -> str:
     return "loopback" if _is_loopback(handler.client_address[0]) else "remote_hub"
+
+
+# KickBack media is deliberately not embedded in signed event payloads. The
+# event carries only this SHA-256 reference; the hub stores the immutable bytes
+# in its content-addressed asset cache. Mesh replication of assets remains an
+# explicit follow-up, while local and remote-hub clients can already publish
+# and render images without inflating the 16 KB user-event limit.
+ASSET_MAX_BYTES = 4 * 1024 * 1024
+ASSET_SHA_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _asset_path(sha: str) -> Path:
+    if not ASSET_SHA_RE.fullmatch(sha):
+        raise ValueError("asset id must be a lowercase SHA-256")
+    root = Path.cwd() / "assets"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / sha
+
+
+def store_asset(handler, sha: str):
+    try:
+        path = _asset_path(sha)
+        raw = read_request_body(handler, ASSET_MAX_BYTES)
+        if not raw:
+            raise BodyError(400, "asset body required")
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual != sha:
+            raise BodyError(400, "asset SHA-256 does not match its content")
+        if not path.exists():
+            tmp = path.with_suffix(".tmp")
+            tmp.write_bytes(raw)
+            tmp.replace(path)
+        body = json.dumps({"status": "OK", "sha256": sha, "size": len(raw)}).encode("utf-8")
+        handler.send_response(201 if path.stat().st_size == len(raw) else 200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+    except BodyError as e:
+        if e.status == 413:
+            handler.close_connection = True
+        handler._send_json(e.status, {"status": "ERROR", "message": e.message})
+    except Exception as e:
+        handler._send_json(400, {"status": "ERROR", "message": str(e)})
+
+
+def serve_asset(handler, sha: str):
+    try:
+        path = _asset_path(sha)
+    except ValueError as e:
+        handler._send_json(400, {"status": "ERROR", "message": str(e)})
+        return
+    if not path.exists():
+        handler._send_json(404, {"status": "ERROR", "message": "asset not found"})
+        return
+    body = path.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/octet-stream")
+    handler.send_header("X-Omni-Asset-Sha256", sha)
+    handler.send_header("Cache-Control", "public, max-age=31536000, immutable")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def asset_refs(payload, depth: int = 0) -> set:
+    """Find content-addressed asset ids without trusting arbitrary payload values."""
+    if depth > 8:
+        return set()
+    found = set()
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in ("image_sha256", "asset_sha256") and isinstance(value, str) and ASSET_SHA_RE.fullmatch(value):
+                found.add(value)
+            else:
+                found.update(asset_refs(value, depth + 1))
+    elif isinstance(payload, list):
+        for value in payload:
+            found.update(asset_refs(value, depth + 1))
+    return found
+
+
+def _cache_asset_bytes(sha: str, raw: bytes) -> bool:
+    if not ASSET_SHA_RE.fullmatch(sha) or len(raw) > ASSET_MAX_BYTES:
+        return False
+    if hashlib.sha256(raw).hexdigest() != sha:
+        return False
+    path = _asset_path(sha)
+    if not path.exists():
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        tmp.replace(path)
+    return True
+
+
+def fetch_asset_from_peer(host: str, port: int, sha: str) -> bool:
+    """Pull one missing asset from the peer that supplied its signed event."""
+    if _asset_path(sha).exists():
+        return True
+    try:
+        code, raw = peer_get(host, port, f"/p2p/assets/{sha}", timeout=30.0)
+        return code == 200 and _cache_asset_bytes(sha, raw)
+    except Exception:
+        return False
+
+
+def push_asset_to_peer(host: str, port: int, sha: str) -> bool:
+    """Best-effort push used by live relay and catch-up's push direction."""
+    try:
+        path = _asset_path(sha)
+        if not path.exists():
+            return False
+        raw = path.read_bytes()
+        code, _ = peer_request(host, port, f"/p2p/assets/{sha}", raw, timeout=30.0)
+        return code in (200, 201)
+    except Exception:
+        return False
 
 # Routes added from v8.13.0 on: path -> fn(handler, query) / (max_bytes, fn(handler, body)).
 # Same gate as every other :5000 path (remote_gate: loopback, or REMOTE_*_PATHS + bearer token).
@@ -5007,6 +5180,30 @@ for _a in OMNIMIND_NODE_ACTIONS:
 # Reads: /api/events/feed leaves omnimind_* events and tagged payloads out unless ?type= asks for an
 # omnimind_* type explicitly (tools, not the feed).
 _FEED_BLOCK_RE = re.compile(r'"feed_injectable"\s*:\s*false')
+KICKBACK_FRIEND_ACTION = "KICKBACK_FRIEND"
+_FRIEND_STATES = {"pending", "accepted", "declined", "removed"}
+_FRIEND_PUBKEY_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def validate_kickback_friend_event(data: dict):
+    payload = data.get("payload") if isinstance(data, dict) else None
+    if not isinstance(payload, dict):
+        raise ValueError("friend event payload must be an object")
+    required = {"schema", "target_pubkey", "state"}
+    if not required.issubset(payload):
+        raise ValueError("friend event requires schema, target_pubkey and state")
+    if payload.get("schema") != 1:
+        raise ValueError("friend event schema must be 1")
+    target = payload.get("target_pubkey")
+    if not isinstance(target, str) or not _FRIEND_PUBKEY_RE.fullmatch(target):
+        raise ValueError("target_pubkey must be a 64-character lowercase Ed25519 public key")
+    state = payload.get("state")
+    if state not in _FRIEND_STATES:
+        raise ValueError("friend state must be pending, accepted, declined or removed")
+    author = payload.get("app_author_pubkey")
+    if isinstance(author, str) and author == target:
+        raise ValueError("a person cannot add themselves")
+
 _process_and_store_event_before_omnimind = process_and_store_event
 _list_feed_events_before_omnimind = list_feed_events
 
@@ -5027,6 +5224,11 @@ def feed_blocked(payload, depth: int = 0) -> bool:
 
 def process_and_store_event(data: dict, origin_peer: str = None, relay: bool = True) -> tuple:
     action = str((data or {}).get("action", "USER_ACTION")).strip() if isinstance(data, dict) else ""
+    if action == KICKBACK_FRIEND_ACTION:
+        try:
+            validate_kickback_friend_event(data)
+        except ValueError as e:
+            return {"status": "ERROR", "message": str(e)}, 400
     if isinstance(data, dict) and not action.startswith("omnimind_") and feed_blocked(data.get("payload")):
         TELEMETRY.inc("events_rejected_feed_policy")
         return {"status": "ERROR", "message": "Human Feed Policy: content tagged feed_injectable=false is "
@@ -6345,6 +6547,9 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
         # Loopback: open as before. Non-loopback: remote hub on + bearer token, else 403/401.
         if not remote_gate(self, "GET", path):
             return
+        if path.startswith("/api/assets/"):
+            serve_asset(self, path.rsplit("/", 1)[-1])
+            return
         if path.startswith("/api/updates/"):
             handle_updates_api(self, path, query)      # v8.30.0, loopback only (+ local token)
             return
@@ -6478,6 +6683,9 @@ class ContinuityIPCHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not remote_gate(self, "POST", self.path):
+            return
+        if self.path.startswith("/api/assets/"):
+            store_asset(self, self.path.rsplit("/", 1)[-1])
             return
         if self.path == "/api/sync/peers":
             # Loopback-only (never in REMOTE_POST_PATHS): an app on this device hands in a peer it
@@ -6718,6 +6926,25 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         quiet-mode silence; anything else is 404 (silent in quiet mode, like before)."""
         self._session = None
         path = self.path.partition("?")[0]
+        is_asset = bool(re.fullmatch(r"/p2p/assets/[0-9a-f]{64}", path))
+        if is_asset:
+            if quiet_active():
+                sess = verify_session(self.headers.get(qm.SESSION_HEADER), _bare(self.client_address[0]),
+                                      "GET", self.path, b"")
+                if sess is None:
+                    self._silent()
+                    return
+                self._session = sess
+                TELEMETRY.inc("p2p_session_requests")
+            else:
+                if not self._mesh_ok(self.headers.get(MESH_HEADER)):
+                    self.reject_mesh(self.headers.get(MESH_HEADER))
+                    return
+                if not self._known_peer(self.client_address[0]):
+                    _deny(self, 403, "asset reads are only served to known peers on this mesh")
+                    return
+            self._serve_peer_asset(path.rsplit("/", 1)[-1])
+            return
         if not path.startswith("/p2p/updates/"):
             self.send_error(404, "Endpoint Not Found")
             return
@@ -6732,6 +6959,24 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         self._session = sess
         TELEMETRY.inc("p2p_session_requests")
         answer_p2p_update_get(self, path)
+
+    def _serve_peer_asset(self, sha: str):
+        try:
+            path = _asset_path(sha)
+        except ValueError as e:
+            self._json_reply(400, {"status": "ERROR", "message": str(e)})
+            return
+        if not path.exists():
+            self._json_reply(404, {"status": "ERROR", "message": "asset not found"})
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("X-Omni-Asset-Sha256", sha)
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         self._session = None
@@ -6824,6 +7069,25 @@ class P2PSyncHandler(BaseHTTPRequestHandler):
         self._json_reply(code, resp)
 
     def _dispatch_post(self):
+        asset_match = re.fullmatch(r"/p2p/assets/([0-9a-f]{64})", self.path)
+        if asset_match:
+            their_mesh = self.headers.get(MESH_HEADER)
+            if not self._mesh_ok(their_mesh):
+                self.reject_mesh(their_mesh)
+                return
+            if not self._known_peer(self.client_address[0]):
+                _deny(self, 403, "asset writes are only accepted from known peers on this mesh")
+                return
+            raw = self._read_capped(ASSET_MAX_BYTES)
+            if raw is None or not raw:
+                _deny(self, 413, "asset body missing or too large")
+                return
+            sha = asset_match.group(1)
+            if not _cache_asset_bytes(sha, raw):
+                self._json_reply(400, {"status": "ERROR", "message": "asset SHA-256 does not match content"})
+                return
+            self._json_reply(201, {"status": "OK", "sha256": sha, "size": len(raw)})
+            return
         if self.path in ("/p2p/reconcile", "/p2p/events"):
             # Catch-up sync (v8.8.0). Mesh first (403, unread), then only loopback / known peers (403):
             # the same hosts live relay already pushes every event to. Nothing here writes to the DB.

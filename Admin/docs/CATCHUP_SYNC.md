@@ -26,7 +26,13 @@ reconciliation** and fetch only the events they lack.
    Nothing is trusted because of where it came from.
 4. Bidirectional: the client pushes the events the peer lacks to the peer's normal `POST /p2p/sync`,
    where the peer verifies them itself. Turn this off with `OMNI_CATCHUP_PUSH=0`.
-5. Caught-up events are not re-relayed (`relay=False`): each peer reconciles for itself.
+5. For event payloads containing a valid `image_sha256` or `asset_sha256`, the client fetches the
+   referenced bytes from the same peer over `GET /p2p/assets/<sha256>` after the event is accepted.
+   The bytes are SHA-256 verified and capped at 4 MiB before being stored in the local asset cache.
+6. In the opposite direction, events sent through the bidirectional push and live relay paths are
+   followed by best-effort `POST /p2p/assets/<sha256>` transfer. Missing assets can therefore heal
+   whether the event arrived by catch-up pull, catch-up push, or live relay.
+7. Caught-up events are not re-relayed (`relay=False`): each peer reconciles for itself.
 
 ### When it runs
 
@@ -50,6 +56,8 @@ reconciliation** and fetch only the events they lack.
 |---|---|
 | `POST :5005/p2p/reconcile` | needs `X-Omni-Mesh` (403 before reading the body, like `/p2p/sync`), and the caller must be loopback, a fresh same-mesh discovered peer, or a host in `OMNI_SYNC_PEERS` (403 otherwise). Read-only. |
 | `POST :5005/p2p/events` | same as `/p2p/reconcile`. Read-only, max 200 ids per request, about 4 MB per response (`truncated: true` when cut short). |
+| `GET :5005/p2p/assets/<sha256>` | same peer and mesh gate; returns one immutable, hash-addressed asset, max 4 MiB. Quiet mesh requires a signed session. |
+| `POST :5005/p2p/assets/<sha256>` | same peer and mesh gate; accepts one hash-verified asset, max 4 MiB. |
 | `POST :5000/api/sync/catchup` | loopback only. It is not in the remote-hub allowlist, so a remote caller gets 403 even with a bearer token. |
 
 The catch-up endpoints serve events only to the hosts live relay already pushes every new event to.
@@ -94,6 +102,7 @@ id lists below 32 items each, so the full id list is only sent when a whole set 
   - B offline while A gets 50 events, then B comes back: B's set equals A's exactly and every event verifies.
   - Tampered rows planted on A are rejected by B: an edited payload (hash mismatch), a forged
     signature, and a valid event under a wrong id.
+  - A `KICKBACK_POST` carrying an image hash causes B to fetch and verify the asset during catch-up.
   - Access rules.
 
   Run with `NO_PROXY=127.0.0.1,localhost` set.

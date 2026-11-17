@@ -128,6 +128,18 @@ class Node:
         assert code == 200, body
         return body["event_id"]
 
+    def post_payload(self, action, payload):
+        code, body = _http(f"{self.ipc}/api/events/append", {"action": action, "payload": payload})
+        assert code == 200, body
+        return body["event_id"]
+
+    def upload_asset(self, sha, body):
+        req = urllib.request.Request(
+            f"{self.ipc}/api/assets/{sha}", data=body,
+            headers={"Content-Type": "application/octet-stream"}, method="POST")
+        with _OPENER.open(req, timeout=10) as response:
+            assert response.status == 201
+
     def catchup(self):
         return _http(f"{self.ipc}/api/sync/catchup", {})
 
@@ -258,6 +270,7 @@ class TwoDaemonCatchupTest(unittest.TestCase):
         self.assertFalse(bad & B.signed_ids())
         self.assertEqual(B.signed_ids(), A.signed_ids() - bad)
         self.assertEqual(B.all_signed_verify(), [])
+
         # A second run tries again and still stores nothing bad.
         code, run = B.catchup()
         s = run["peers"][0]
@@ -278,6 +291,16 @@ class TwoDaemonCatchupTest(unittest.TestCase):
         self.assertEqual((code, ok["negentropy"]), (200, "61"))
 
         print("\n[catch-up stats] " + json.dumps(stats_log), file=sys.stderr)
+
+    def test_z_asset_follows_event_catchup(self):
+        body = b"catch-up image bytes"
+        sha = hashlib.sha256(body).hexdigest()
+        self.A.upload_asset(sha, body)
+        self.A.post_payload("KICKBACK_POST", {"text": "with image", "image_sha256": sha})
+        code, run = self.B.catchup()
+        self.assertEqual(code, 200, run)
+        self.assertEqual(run["peers"][0]["assets_fetched"], 1, run)
+        self.assertEqual((self.B.cwd / "assets" / sha).read_bytes(), body)
 
 
 class GateTests(unittest.TestCase):
