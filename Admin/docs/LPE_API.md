@@ -96,8 +96,17 @@ bad signature. 429 for the per-key rate limit.
              "vibe_count": 2, "xp": 350, "plaza_credits": 60, "idle_seconds_claimed": 1800,
              "last_claim_ts": 1793500000000, "profile_ts": 1793400000000, "updated_ts": 1793400000000,
              "event_id": "0x…"},
- "reputation": {"…": "same as GET /api/lpe/reputation"}}
+ "reputation": {"…": "same as GET /api/lpe/reputation"},
+ "sign": {"signer": "<this node's 64-hex pubkey>", "ts": 1793400000000,
+          "signature": "<128 hex: the node's Ed25519 signature over the profile + reputation>"}}
 ```
+`sign` is the daemon's attestation (R-19): the profile view is signed with the node's own key, in the
+same event envelope as every other signed thing on the mesh. Verify it by rebuilding the event
+`{"action": "lpe_profile_attest", "author_pubkey": sign.signer, "payload": {"profile": …, "reputation": …},
+"previous_hash": profile.event_id, "ts": sign.ts, "signature": sign.signature}` and checking the
+signature against the canonical event bytes (`Admin/omni_signing.py`: `verify_lpe_profile`). Any
+change to the profile, the reputation, the signer or the timestamp fails verification. Daemons that
+predate profile signing omit `sign`; treat an unsigned profile as unattested, never as verified.
 Returns 404 when the key has no LPE profile on this node. `xp_multiplier` is shown for clients to
 display. It is **not** applied to stored XP (see decisions below).
 
