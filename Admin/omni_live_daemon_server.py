@@ -4903,9 +4903,9 @@ class _LpeCtx:
         return process_and_store_event({"action": action, "payload": payload}, origin_peer=None, relay=False)
 
     @staticmethod
-  def sign_profile_view(profile, reputation):
-    """Daemon attestation over an LPE profile view (R-19)."""
-  return sign_lpe_profile(STATE.signing_key, profile, reputation)
+    def sign_profile_view(profile, reputation):
+        """Daemon attestation over an LPE profile view (R-19)."""
+      return sign_lpe_profile(STATE.signing_key, profile, reputation)
                           
 
 LPE_CTX = _LpeCtx()
