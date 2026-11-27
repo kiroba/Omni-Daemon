@@ -97,6 +97,47 @@ def verify_event(event: dict) -> bool:
         return False
 
 
+# --- LPE profile attestation (R-19) ------------------------------------------------------------
+# GET /api/lpe/profile hands a profile view to another party (a phone, a peer, a Hub), so the
+# daemon attests the view with its own node key, in the same event envelope as every other signed
+# thing on the mesh. The attestation binds the exact profile + reputation dicts and the profile's
+# source event id; it does not cover "status" (transport framing). A consumer re-verifies with
+# verify_lpe_profile; any change to profile, reputation, signer or ts makes it fail.
+
+LPE_PROFILE_ATTEST_ACTION = "lpe_profile_attest"
+
+
+def sign_lpe_profile(key: Ed25519PrivateKey, profile: dict, reputation: dict, ts: int = None) -> dict:
+    """Attest a profile view as the daemon node. Returns the 'sign' envelope for the response."""
+    if ts is None:
+        ts = now_ms()
+    sig = sign_event(key, {
+        "action": LPE_PROFILE_ATTEST_ACTION,
+        "author_pubkey": pubkey_hex(key),
+        "payload": {"profile": profile, "reputation": reputation},
+        "previous_hash": profile["event_id"],
+        "ts": ts,
+    })
+    return {"signer": pubkey_hex(key), "ts": ts, "signature": sig}
+
+
+def verify_lpe_profile(resp: dict) -> bool:
+    """True only if resp['sign'] was made by the node key behind resp['sign']['signer'] over
+    exactly resp['profile'] and resp['reputation']. Any tamper fails; malformed input is False."""
+    try:
+        sign = resp["sign"]
+        return verify_event({
+            "action": LPE_PROFILE_ATTEST_ACTION,
+            "author_pubkey": sign["signer"],
+            "payload": {"profile": resp["profile"], "reputation": resp["reputation"]},
+            "previous_hash": resp["profile"]["event_id"],
+            "ts": sign["ts"],
+            "signature": sign["signature"],
+        })
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
 # --- Trusted-key allowlist --------------------------------------------------------------------
 TRUSTED_KEYS_ENV = "OMNI_TRUSTED_KEYS_FILE"
 

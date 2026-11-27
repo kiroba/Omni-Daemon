@@ -467,7 +467,9 @@ def avatar_view(state: dict, pk: str, viewer: str = None, today: int = None) -> 
 # ctx (built by the daemon): node_id, events() -> verified LPE events, parse_signed(data, validators) ->
 # event (raises ValueError -> 400, PermissionError -> 401), store_person(data, validators) -> (resp,
 # status), store_node(action, payload) -> (resp, status), seeds() -> set or None, now_ms() -> int,
-# vibes_per_day -> int.
+# vibes_per_day -> int. sign_profile_view(profile, reputation) -> dict, optional: the daemon's
+# attestation over a profile view (absent on daemons that predate profile signing; get_profile
+# then omits "sign").
 
 def _query(query: str, allowed: set) -> dict:
     if len(query or "") > 2048:
@@ -503,8 +505,14 @@ def get_profile(ctx, query: str) -> tuple:
     st = _state(ctx)
     if pk not in st["profiles"]:
         return {"status": "ERROR", "message": "no LPE profile for that key on this node", "pubkey": pk}, 404
-    return {"status": "OK", "profile": avatar_view(st, pk, viewer, ctx.now_ms() // DAY_MS),
-            "reputation": reputation_view(st, pk)}, 200
+    resp = {"status": "OK", "profile": avatar_view(st, pk, viewer, ctx.now_ms() // DAY_MS),
+            "reputation": reputation_view(st, pk)}
+    # R-19: the daemon attests this view with its own node key when the ctx provides
+    # sign_profile_view; daemons that predate profile signing return it unsigned.
+    sign = getattr(ctx, "sign_profile_view", None)
+    if callable(sign):
+        resp["sign"] = sign(resp["profile"], resp["reputation"])
+    return resp, 200
 
 
 def get_plaza(ctx, query: str) -> tuple:

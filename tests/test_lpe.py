@@ -22,6 +22,7 @@ from daemon_harness import ADMIN, Daemon, Key, daemon_module, http, now_ms  # no
 from daemon_version import DAEMON_VERSION  # noqa: E402
 
 import omni_lpe as lpe  # noqa: E402  (daemon_harness put Admin/ on sys.path)
+import omni_signing as sig  # noqa: E402  (R-19 profile attestation sign/verify)
 
 ZERO = "0x" + "0" * 64
 NODE = "f" * 64
@@ -217,6 +218,80 @@ class Unit(unittest.TestCase):
         self.assertEqual(set(d.LPE_ACTIONS), set(lpe.ALL_ACTIONS))
         self.assertIsNone(d._LPE_MODULE, "omni_lpe must not load until the first /api/lpe request")
 
+    def test_profile_response_is_daemon_signed(self):
+        """R-19: get_profile attests the view with the node key; the attestation verifies."""
+        node_key = Key()
+        alice = pk(1)
+        ctx = _SigningCtx([ev(lpe.PROFILE, alice, 1_800_000_000_000, {"handle": "alice"})], node_key)
+        resp, code = lpe.get_profile(ctx, f"pubkey={alice}")
+        self.assertEqual(code, 200, resp)
+        self.assertIn("sign", resp)
+        self.assertEqual(resp["sign"]["signer"], node_key.pub)
+        self.assertTrue(sig.verify_lpe_profile(resp))
+
+    def test_profile_tamper_breaks_attestation(self):
+        """R-19: any change to the profile, the reputation or the signer fails verification."""
+        node_key = Key()
+        alice = pk(1)
+        ctx = _SigningCtx([ev(lpe.PROFILE, alice, 1_800_000_000_000, {"handle": "alice"})], node_key)
+        resp, code = lpe.get_profile(ctx, f"pubkey={alice}")
+        self.assertEqual(code, 200, resp)
+        self.assertFalse(sig.verify_lpe_profile(dict(resp, profile=dict(resp["profile"], handle="mallory"))))
+        self.assertFalse(sig.verify_lpe_profile(dict(resp, reputation=dict(resp["reputation"], score=9999))))
+        self.assertFalse(sig.verify_lpe_profile(dict(resp, sign=dict(resp["sign"], signer=Key().pub))))
+        self.assertFalse(sig.verify_lpe_profile(dict(resp, sign=dict(resp["sign"], signature="00" * 64))))
+        self.assertFalse(sig.verify_lpe_profile({"status": "OK", "profile": resp["profile"],
+                                                  "reputation": resp["reputation"]}))
+        self.assertFalse(sig.verify_lpe_profile({}))
+
+    def test_profile_unsigned_without_signing_ctx(self):
+        """R-19: a ctx without sign_profile_view (older daemon) returns the profile unsigned."""
+        alice = pk(1)
+        ctx = _PlainCtx([ev(lpe.PROFILE, alice, 1_800_000_000_000, {"handle": "alice"})])
+        resp, code = lpe.get_profile(ctx, f"pubkey={alice}")
+        self.assertEqual(code, 200, resp)
+        self.assertNotIn("sign", resp)
+
+
+class _SigningCtx:
+    """Minimal LPE ctx with a node key, for the R-19 get_profile signing tests."""
+
+    def __init__(self, events, node_key):
+        self._events = events
+        self.node_id = node_key.pub
+        self.vibes_per_day = lpe.VIBES_PER_DAY_DEFAULT
+        self._node_key = node_key
+
+    def events(self):
+        return list(self._events)
+
+    def seeds(self):
+        return None
+
+    def now_ms(self):
+        return 1_800_000_000_000
+
+    def sign_profile_view(self, profile, reputation):
+        return sig.sign_lpe_profile(self._node_key.sk, profile, reputation, ts=self.now_ms())
+
+
+class _PlainCtx:
+    """Minimal LPE ctx without sign_profile_view (a daemon that predates profile signing)."""
+
+    def __init__(self, events):
+        self._events = events
+        self.node_id = NODE
+        self.vibes_per_day = lpe.VIBES_PER_DAY_DEFAULT
+
+    def events(self):
+        return list(self._events)
+
+    def seeds(self):
+        return None
+
+    def now_ms(self):
+        return 1_800_000_000_000
+
 
 class LiveLpe(unittest.TestCase):
     @classmethod
@@ -246,7 +321,15 @@ class LiveLpe(unittest.TestCase):
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": "0" * 64})[0], 404)
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": "zz"})[0], 400)
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": self.alice.pub, "x": "1"})[0], 400)
-
+    def test_profile_response_is_daemon_signed(self):
+        """R-19: the live daemon attests the profile view with its node key."""
+        code, r = self.d.get("/api/lpe/profile", {"pubkey": self.alice.pub})
+        self.assertEqual(code, 200, r)
+        self.assertIn("sign", r)
+        self.assertTrue(sig.verify_lpe_profile(r))
+        tampered = dict(r, profile=dict(r["profile"], handle="mallory"))
+        self.assertFalse(sig.verify_lpe_profile(tampered))
+    
     def test_forged_unsigned_and_raw_append_rejected(self):
         good = signed(self.alice, "lpe_reputation_vote", {"target": self.bob.pub, "rating": 3})
         forged = dict(good, payload=dict(good["payload"], rating=5))              # tampered after signing

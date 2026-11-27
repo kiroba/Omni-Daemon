@@ -5,7 +5,8 @@ _sys.path.insert(0, str(_P(__file__).resolve().parent.parent / 'Admin'))
 import tempfile
 from pathlib import Path
 
-from omni_signing import load_or_create_key, pubkey_hex, sign_event, verify_event
+from omni_signing import (load_or_create_key, pubkey_hex, sign_event, verify_event,
+                          sign_lpe_profile, verify_lpe_profile)
 
 tmp = Path(tempfile.mkdtemp())
 
@@ -42,4 +43,19 @@ print("[pass] forged author rejected")
 assert not verify_event({k: v for k, v in event.items() if k != "signature"})
 assert not verify_event(dict(event, signature="zz"))
 print("[pass] missing or malformed signature rejected")
-print("ALL 5 PASSED")
+
+# 6. LPE profile attestation (R-19): the daemon signs a profile view with its node key
+profile = {"pubkey": pubkey_hex(alice), "handle": "alice", "event_id": "0x" + "11" * 32}
+reputation = {"score": 500, "tier": "CITIZEN"}
+resp = {"status": "OK", "profile": profile, "reputation": reputation,
+        "sign": sign_lpe_profile(alice, profile, reputation, ts=1761590000000)}
+assert verify_lpe_profile(resp)
+print("[pass] daemon-attested profile verifies")
+
+# 7. Tampered profile / reputation / signer / unsigned all fail
+assert not verify_lpe_profile(dict(resp, profile=dict(profile, handle="mallory")))
+assert not verify_lpe_profile(dict(resp, reputation=dict(reputation, score=9999)))
+assert not verify_lpe_profile(dict(resp, sign=dict(resp["sign"], signer=pubkey_hex(mallory))))
+assert not verify_lpe_profile({"status": "OK", "profile": profile, "reputation": reputation})
+print("[pass] tampered or unsigned profile rejected")
+print("ALL 7 PASSED")
