@@ -321,7 +321,15 @@ class LiveLpe(unittest.TestCase):
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": "0" * 64})[0], 404)
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": "zz"})[0], 400)
         self.assertEqual(self.d.get("/api/lpe/profile", {"pubkey": self.alice.pub, "x": "1"})[0], 400)
-
+    def test_profile_response_is_daemon_signed(self):
+        """R-19: the live daemon attests the profile view with its node key."""
+        code, r = self.d.get("/api/lpe/profile", {"pubkey": self.alice.pub})
+        self.assertEqual(code, 200, r)
+        self.assertIn("sign", r)
+        self.assertTrue(sig.verify_lpe_profile(r))
+        tampered = dict(r, profile=dict(r["profile"], handle="mallory"))
+        self.assertFalse(sig.verify_lpe_profile(tampered))
+    
     def test_forged_unsigned_and_raw_append_rejected(self):
         good = signed(self.alice, "lpe_reputation_vote", {"target": self.bob.pub, "rating": 3})
         forged = dict(good, payload=dict(good["payload"], rating=5))              # tampered after signing
