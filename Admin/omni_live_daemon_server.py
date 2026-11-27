@@ -4905,7 +4905,7 @@ class _LpeCtx:
     @staticmethod
     def sign_profile_view(profile, reputation):
         """Daemon attestation over an LPE profile view (R-19)."""
-      return sign_lpe_profile(STATE.signing_key, profile, reputation)
+        return sign_lpe_profile(STATE.signing_key, profile, reputation)
                           
 
 LPE_CTX = _LpeCtx()
